@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+.pytest_cache/
+.benchmarks/
+.ruff_cache/
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Local state and editor files
+.DS_Store
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+.copilot/
+.copilot-hub/

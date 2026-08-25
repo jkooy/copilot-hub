@@ -1,0 +1,1994 @@
+{% extends "base.html" %}
+{% block title %}Workspace · Copilot Hub{% endblock %}
+{% block body_class %}workspace-page{% endblock %}
+{% block main_class %}workspace-main{% endblock %}
+{% block content %}
+<div class="workspace" id="workspace">
+  <aside class="rail sessions-rail" aria-label="Sessions and active work">
+    <section class="rail-section">
+      <div class="section-heading">
+        <div>
+          <h2>Sessions</h2>
+          <small id="session-count">{{ workers|length }}/{{ max_sessions }}</small>
+        </div>
+        <div class="heading-actions">
+          <button id="add-worker" class="icon-button" type="button">+ Worker</button>
+          <button id="session-settings-toggle" class="icon-button" type="button" aria-expanded="false" aria-controls="session-settings">Settings</button>
+        </div>
+      </div>
+      <p id="session-action-feedback" class="feedback" hidden></p>
+      <div id="session-settings" class="settings-panel" hidden>
+        <label for="worker-limit">Maximum workers</label>
+        <input id="worker-limit" type="number" min="1" max="16" value="{{ max_workers }}">
+        <small id="worker-limit-help">{{ max_workers }} workers + 1 Manager = {{ max_sessions }} total sessions.</small>
+        <div class="settings-actions">
+          <button id="cancel-worker-limit" type="button">Cancel</button>
+          <button id="save-worker-limit" class="primary" type="button">Save</button>
+        </div>
+      </div>
+      <nav id="session-list" class="session-list" aria-label="Copilot sessions">
+        {% for worker in workers %}
+        <a
+          href="/?worker={{ worker.id }}"
+          class="session-item{% if worker.id == selected_worker.id %} selected{% endif %}"
+          data-worker-id="{{ worker.id }}"
+          data-role="{{ worker.role }}"
+        >
+          <span class="session-copy">
+            <strong>{{ worker.display_name }}</strong>
+            <small class="session-activity">{{ worker.activity_label or worker_status_presentation(worker.state).label }}</small>
+          </span>
+          <span class="status {{ worker_status_presentation(worker.state).css_class }}">{{ worker_status_presentation(worker.state).label }}</span>
+        </a>
+        {% endfor %}
+      </nav>
+    </section>
+
+    <section class="rail-section">
+      <div class="section-heading">
+        <h2>Active work</h2>
+        <span id="active-work-count">{{ active_work|length }}</span>
+      </div>
+      <div id="active-work" class="stack-list">
+        {% for item in active_work %}
+        <article class="work-item" data-work-key="{{ item.key }}">
+          <div class="item-heading">
+            <span class="status {{ item.status }}">{{ item.status_label }}</span>
+            <strong>{{ item.title }}</strong>
+          </div>
+          {% if item.context %}<p>{{ item.context }}</p>{% endif %}
+          <small>{{ item.worker_name }}</small>
+          {% if item.action_url %}<a href="{{ item.action_url }}">{{ item.action_label }}</a>{% endif %}
+        </article>
+        {% else %}
+        <p class="empty-state">No active delegated work.</p>
+        {% endfor %}
+      </div>
+    </section>
+  </aside>
+
+  <section class="terminal-pane" aria-label="Selected Copilot terminal">
+    <div class="terminal-toolbar">
+      <div class="terminal-identity">
+        <strong id="terminal-session-name">{{ selected_worker.display_name }}</strong>
+        <small id="terminal-session-id" class="mono">{{ selected_worker.copilot_session_id }}</small>
+      </div>
+      <div class="terminal-actions">
+        <span id="terminal-selection-summary" class="selection-summary" hidden></span>
+        <button id="copy-terminal-selection" type="button" disabled>Copy selection</button>
+        <button id="reconnect-terminal" type="button">Reconnect</button>
+        <button
+          id="retire-worker"
+          class="danger"
+          type="button"
+          {% if selected_worker.role == "manager" %}hidden{% endif %}
+        >Retire worker</button>
+        <span id="terminal-status" class="status pending">connecting</span>
+      </div>
+    </div>
+    <div id="terminal" aria-label="Copilot terminal"></div>
+  </section>
+
+  <aside class="rail details-rail" aria-label="Results and session reporting">
+    <section class="rail-section">
+      <details id="results-panel" open>
+        <summary class="section-heading">
+          <h2>Results</h2>
+          <span id="result-count">{{ result_summary.total }}</span>
+        </summary>
+        <p id="result-feedback" class="feedback" hidden></p>
+        <div id="results-list" class="stack-list">
+          {% for task in results %}
+          <article class="result-item{% if task.result.viewed_at %} viewed{% endif %}" data-result-id="{{ task.id }}">
+            <div class="item-heading">
+              <span class="status {{ task.status }}">{{ task.status.replace("_", " ") }}</span>
+              <strong>{{ task.title }}</strong>
+            </div>
+            <p>{{ task.result.response or task.result.error }}</p>
+            <small>{{ task.worker_display_name or "worker" }}</small>
+            <div class="item-actions">
+              <button type="button" data-result-action="view" data-task-id="{{ task.id }}">View</button>
+              <button type="button" data-result-action="manager" data-task-id="{{ task.id }}">Send to Manager</button>
+              <button type="button" data-result-action="clear" data-task-id="{{ task.id }}">Clear</button>
+            </div>
+          </article>
+          {% else %}
+          <p class="empty-state">No worker results yet.</p>
+          {% endfor %}
+        </div>
+      </details>
+    </section>
+
+    <section class="rail-section">
+      <details id="memory-panel">
+        <summary class="section-heading">
+          <h2>Memory</h2>
+          <span id="memory-pressure" class="status {{ memory.pressure }}">{{ memory.pressure }}</span>
+        </summary>
+        <dl id="memory-report" class="report-grid">
+          <dt>Used</dt><dd>{{ memory.used_percent }}%</dd>
+          <dt>Available</dt><dd data-bytes="{{ memory.available_bytes }}"></dd>
+          <dt>Hub sessions</dt><dd data-bytes="{{ memory.hub_rss_bytes }}"></dd>
+          <dt>Swap used</dt><dd data-bytes="{{ memory.swap_used_bytes }}"></dd>
+        </dl>
+      </details>
+    </section>
+
+    <section class="rail-section">
+      <details id="handoffs-panel">
+        <summary class="section-heading"><h2>Handoffs</h2><span>{{ reporting.handoffs|length }}</span></summary>
+        <div id="handoffs-list" class="stack-list">
+          {% for update in reporting.handoffs %}
+          <article class="report-item">
+            <strong>{{ update.title }}</strong>
+            <p>{{ update.summary }}</p>
+            <small>{{ update.worker_display_name }} · {{ update.status }}</small>
+          </article>
+          {% else %}
+          <p class="empty-state">No handoffs recorded.</p>
+          {% endfor %}
+        </div>
+      </details>
+    </section>
+
+    <section class="rail-section">
+      <details id="usage-panel">
+        <summary class="section-heading"><h2>Usage</h2><span>{{ reporting.usage|length }}</span></summary>
+        <div id="usage-list" class="stack-list">
+          {% for person in reporting.usage %}
+          <article class="report-item">
+            <strong>{{ person.display_name }}</strong>
+            <small>{{ person.completed_count }} completed{% if person.success_rate is not none %} · {{ person.success_rate }}% success{% endif %}</small>
+            <small>{{ person.usage.recorded_tokens }} recorded tokens · {{ person.usage.premium_requests }} premium requests</small>
+          </article>
+          {% endfor %}
+        </div>
+      </details>
+    </section>
+  </aside>
+</div>
+
+<dialog id="result-dialog">
+  <form method="dialog"><button aria-label="Close result">Close</button></form>
+  <h2 id="result-dialog-title">Worker result</h2>
+  <pre id="result-dialog-content"></pre>
+</dialog>
+
+<script src="{{ url_for('static', path='vendor/xterm.js') }}"></script>
+<script src="{{ url_for('static', path='vendor/addon-fit.js') }}"></script>
+<script>
+const initialWorkers = {{ workers|tojson }};
+let workers = new Map(initialWorkers.map((worker) => [worker.id, worker]));
+let workerId = {{ selected_worker.id|tojson }};
+let socket = null;
+let connectionGeneration = 0;
+let reconnectTimer = 0;
+let pollTimer = 0;
+const clientId = crypto.randomUUID();
+const states = new Map();
+const workspaceStorageKey = "copilot-hub.workspace.v1";
+const debugStorageKey = "copilot-hub.terminal-debug";
+const terminalSelectionHoldTimeout = 30000;
+const terminalSelectionMaxDeferredBytes = 4 * 1024 * 1024;
+const terminalSelectionEdgeSize = 32;
+const terminalSelectionEdgeIntent = 8;
+const terminalSelectionDragThreshold = 6;
+const terminalSelectionEdgeActivation = 300;
+const terminalSelectionEdgeInterval = 140;
+const terminalSelectionEdgeSettle = 90;
+const terminalSelectionWheelSettle = 300;
+const terminalElement = document.getElementById("terminal");
+const terminalStatus = document.getElementById("terminal-status");
+const sessionList = document.getElementById("session-list");
+const activeWork = document.getElementById("active-work");
+const activeWorkCount = document.getElementById("active-work-count");
+const resultsList = document.getElementById("results-list");
+const resultCount = document.getElementById("result-count");
+const resultFeedback = document.getElementById("result-feedback");
+const terminalSessionName = document.getElementById("terminal-session-name");
+const terminalSessionId = document.getElementById("terminal-session-id");
+const selectionSummary = document.getElementById("terminal-selection-summary");
+const copySelection = document.getElementById("copy-terminal-selection");
+const reconnectTerminal = document.getElementById("reconnect-terminal");
+const retireWorker = document.getElementById("retire-worker");
+const addWorker = document.getElementById("add-worker");
+const settingsToggle = document.getElementById("session-settings-toggle");
+const settingsPanel = document.getElementById("session-settings");
+const workerLimit = document.getElementById("worker-limit");
+const workerLimitHelp = document.getElementById("worker-limit-help");
+const saveWorkerLimit = document.getElementById("save-worker-limit");
+const cancelWorkerLimit = document.getElementById("cancel-worker-limit");
+const sessionCount = document.getElementById("session-count");
+const sessionFeedback = document.getElementById("session-action-feedback");
+const resultDialog = document.getElementById("result-dialog");
+const resultDialogTitle = document.getElementById("result-dialog-title");
+const resultDialogContent = document.getElementById("result-dialog-content");
+let maximumWorkers = {{ max_workers }};
+let terminalCopyFeedbackTimer = 0;
+let debugEnabled = new URL(location.href).searchParams.has("terminal_debug");
+try {
+  debugEnabled ||= localStorage.getItem(debugStorageKey) === "1";
+} catch {
+  // URL debug mode remains available when storage is disabled.
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function debug(...values) {
+  if (debugEnabled) console.debug("[copilot-hub terminal]", ...values);
+}
+
+function savePreference(key, value) {
+  try {
+    const stored = JSON.parse(localStorage.getItem(workspaceStorageKey) || "{}");
+    stored[key] = value;
+    localStorage.setItem(workspaceStorageKey, JSON.stringify(stored));
+  } catch {
+    // Browser persistence is optional.
+  }
+}
+
+function readPreference(key) {
+  try {
+    return JSON.parse(localStorage.getItem(workspaceStorageKey) || "{}")[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function setStatus(label, cssClass) {
+  terminalStatus.textContent = label;
+  terminalStatus.className = `status ${cssClass}`;
+}
+
+function terminalOptions() {
+  return {
+    cursorBlink: true,
+    convertEol: false,
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+    fontSize: 14,
+    lineHeight: 1.2,
+    scrollback: 10000,
+    scrollOnUserInput: true,
+    screenReaderMode: true,
+    macOptionClickForcesSelection: true,
+    rightClickSelectsWord: true,
+    theme: {
+      background: "#05080c",
+      foreground: "#e8edf4",
+      cursor: "#69b7ff",
+      selectionBackground: "#264d73",
+      black: "#0b0f14",
+      brightBlack: "#64748b",
+      blue: "#69b7ff",
+      brightBlue: "#91caff",
+      green: "#45d483",
+      yellow: "#f0c24f",
+      red: "#ff6b75",
+    },
+  };
+}
+
+function visiblePrompt(state) {
+  const buffer = state.term.buffer.active;
+  const row = buffer.getLine(buffer.baseY + buffer.cursorY);
+  if (!row) return false;
+  const line = row.translateToString(false, 0, buffer.cursorX);
+  if (/\[Paste #\d+\b/.test(line)) return true;
+  const marker = Math.max(line.lastIndexOf("❯"), line.lastIndexOf("›"), line.lastIndexOf(">"));
+  if (marker < 0) return false;
+  const content = line.slice(marker + 1).trim();
+  return Boolean(content && !/^(?:ask copilot|type a message|enter a prompt)$/i.test(content));
+}
+
+function promptInput(state, data) {
+  let promptSubmit = false;
+  let submittedPrompt = null;
+  let promptCancel = data === "\x1b";
+  for (let index = 0; index < data.length; index += 1) {
+    if (data.startsWith("\x1b[200~", index)) {
+      state.bracketedPaste = true;
+      index += 5;
+      continue;
+    }
+    if (data.startsWith("\x1b[201~", index)) {
+      state.bracketedPaste = false;
+      index += 5;
+      continue;
+    }
+    const character = data[index];
+    if (character === "\x03" || character === "\x15" || (character === "\x1b" && data.length === 1)) {
+      state.promptDirty = false;
+      state.promptText = "";
+      state.promptKnown = true;
+      state.bracketedPaste = false;
+      promptCancel = true;
+    } else if (character === "\r" && !state.bracketedPaste) {
+      if (state.promptDirty || visiblePrompt(state)) {
+        promptSubmit = true;
+        if (state.promptKnown && state.promptText.trim()) submittedPrompt = state.promptText;
+      }
+      state.promptDirty = false;
+      state.promptText = "";
+      state.promptKnown = true;
+    } else if ((character === "\r" || character === "\n") && state.bracketedPaste) {
+      if (state.promptKnown) state.promptText += "\n";
+      state.promptDirty = true;
+    } else if (character === "\x7f" || character === "\b") {
+      if (state.promptKnown) {
+        state.promptText = state.promptText.slice(0, -1);
+        state.promptDirty = Boolean(state.promptText);
+      }
+    } else if (character === "\x1b" && data[index + 1] === "[") {
+      let finalIndex = index + 2;
+      while (finalIndex < data.length && !(data[finalIndex] >= "@" && data[finalIndex] <= "~")) {
+        finalIndex += 1;
+      }
+      state.promptKnown = false;
+      state.promptDirty = true;
+      index = finalIndex;
+    } else if (character === "\t") {
+      state.promptKnown = false;
+      state.promptDirty = true;
+    } else if (character >= " ") {
+      if (state.promptKnown) state.promptText += character;
+      state.promptDirty = true;
+    } else {
+      state.promptKnown = false;
+      state.promptDirty = true;
+    }
+  }
+  return {
+    data,
+    prompt_submit: promptSubmit,
+    prompt: submittedPrompt,
+    prompt_cancel: promptCancel,
+    prompt_dirty: state.promptDirty,
+  };
+}
+
+function terminalBufferText(term) {
+  if (!term) return "";
+  const buffer = term.buffer.active;
+  const lines = [];
+  for (let index = 0; index < buffer.length; index += 1) {
+    lines.push(buffer.getLine(index)?.translateToString(true) || "");
+  }
+  return lines.join("\n");
+}
+
+function captureTerminalViewport(state) {
+  if (!state?.term || state.restoringScroll || state.replaying) return;
+  const buffer = state.term.buffer.active;
+  state.followingOutput = buffer.viewportY >= buffer.baseY;
+  state.viewportY = buffer.viewportY;
+}
+
+function restoreTerminalViewport(state) {
+  if (!state?.term) return;
+  state.restoringScroll = true;
+  try {
+    const buffer = state.term.buffer.active;
+    if (state.followingOutput) {
+      state.term.scrollToBottom();
+    } else {
+      state.term.scrollToLine(
+        Math.max(0, Math.min(state.viewportY, buffer.baseY)),
+      );
+    }
+  } finally {
+    state.restoringScroll = false;
+  }
+  captureTerminalViewport(state);
+}
+
+async function writeClipboardText(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall back when Clipboard is exposed but unavailable to this page.
+    }
+  }
+  const input = document.createElement("textarea");
+  input.value = text;
+  input.setAttribute("readonly", "");
+  input.style.position = "fixed";
+  input.style.left = "-9999px";
+  document.body.appendChild(input);
+  try {
+    input.select();
+    if (!document.execCommand("copy")) {
+      throw new Error("Browser rejected the clipboard copy request");
+    }
+  } finally {
+    input.remove();
+  }
+}
+
+function terminalSelectionText(state) {
+  if (!state?.term) return "";
+  return state.selectionNavigationText
+    || state.extendedSelectionText
+    || state.term.getSelection()
+    || (state.selectionHold ? state.heldSelectionText : "");
+}
+
+function mergeTerminalSelectionText(firstText, secondText) {
+  if (!firstText) return secondText;
+  if (!secondText || firstText === secondText) return firstText;
+  const first = firstText.split("\n");
+  const second = secondText.split("\n");
+  const lengths = Array.from(
+    {length: first.length + 1},
+    () => new Uint16Array(second.length + 1),
+  );
+  for (let left = first.length - 1; left >= 0; left -= 1) {
+    for (let right = second.length - 1; right >= 0; right -= 1) {
+      lengths[left][right] = first[left] === second[right]
+        ? lengths[left + 1][right + 1] + 1
+        : Math.max(lengths[left + 1][right], lengths[left][right + 1]);
+    }
+  }
+  const merged = [];
+  let left = 0;
+  let right = 0;
+  while (left < first.length && right < second.length) {
+    if (first[left] === second[right]) {
+      merged.push(first[left]);
+      left += 1;
+      right += 1;
+    } else if (lengths[left + 1][right] >= lengths[left][right + 1]) {
+      merged.push(first[left]);
+      left += 1;
+    } else {
+      merged.push(second[right]);
+      right += 1;
+    }
+  }
+  merged.push(...first.slice(left), ...second.slice(right));
+  return merged.join("\n");
+}
+
+function syncTerminalCopyButton(state = states.get(workerId)) {
+  if (!state || state.workerId !== workerId) return;
+  const selectedText = terminalSelectionText(state);
+  const visibleSelection = state.term.getSelection();
+  const selectionOffscreen = Boolean(
+    state.selectionNavigationText
+    && !state.selectionNavigationFragments.some(
+      (fragment) => fragment.text === visibleSelection,
+    )
+  );
+  const crossPageSelection = Boolean(
+    state.extendedSelectionText
+    && state.extendedSelectionText !== visibleSelection
+  );
+  const selectedLineCount = selectedText ? selectedText.split("\n").length : 0;
+  const canCopy = Boolean(selectedText) && !state.copyPending;
+  copySelection.disabled = !canCopy;
+  if (selectionOffscreen && !crossPageSelection) {
+    copySelection.title =
+      `Copy ${selectedLineCount} selected ${
+        selectedLineCount === 1 ? "line" : "lines"
+      } (currently offscreen)`;
+  } else if (crossPageSelection) {
+    copySelection.title = `Copy ${selectedLineCount} selected lines across pages`;
+  } else {
+    copySelection.title = canCopy
+      ? "Copy selected terminal text"
+      : "Select terminal text to copy";
+  }
+  selectionSummary.hidden = !crossPageSelection && !selectionOffscreen;
+  if (selectionOffscreen && !crossPageSelection) {
+    selectionSummary.textContent = `${selectedLineCount} selected ${
+      selectedLineCount === 1 ? "line" : "lines"
+    } is offscreen`;
+  } else {
+    selectionSummary.textContent = crossPageSelection
+      ? `${selectedLineCount} lines selected across pages`
+      : "";
+  }
+}
+
+function releaseTerminalSelection(state, {clearSelection = false} = {}) {
+  if (!state) return;
+  const hold = state.selectionHold;
+  state.selectionHold = null;
+  state.selectionAutoScrollWriting = false;
+  state.extendedSelectionText = "";
+  state.extendedSelectionFragments = [];
+  state.selectionNavigationText = "";
+  state.selectionNavigationFragments = [];
+  state.selectionViewingOffscreen = false;
+  state.suppressSelectionRestore = false;
+  clearTimeout(state.selectionHoldTimer);
+  state.selectionHoldTimer = 0;
+  if (clearSelection && state.term) state.term.clearSelection();
+  if (!state.term?.hasSelection()) {
+    state.heldSelectionText = "";
+    state.heldSelectionPosition = null;
+  }
+  hold?.resolve();
+  syncTerminalCopyButton();
+}
+
+function holdTerminalSelection(state) {
+  if (!state?.term) return null;
+  if (!state.selectionHold) {
+    let resolve;
+    let bypass;
+    const promise = new Promise((release) => {
+      resolve = release;
+    });
+    const bypassPromise = new Promise((release) => {
+      bypass = release;
+    });
+    state.selectionHold = {promise, resolve, bypassPromise, bypass};
+  }
+  clearTimeout(state.selectionHoldTimer);
+  state.selectionHoldTimer = window.setTimeout(() => {
+    state.selectingWithMouse = false;
+    releaseTerminalSelection(state, {clearSelection: true});
+  }, terminalSelectionHoldTimeout);
+  syncTerminalCopyButton(state);
+  return state.selectionHold.promise;
+}
+
+function rememberTerminalSelection(state) {
+  if (state.selectionNavigationText) {
+    state.heldSelectionText = state.selectionNavigationText;
+    return;
+  }
+  const text = state.term.getSelection();
+  if (!text) return;
+  const position = state.term.getSelectionPosition?.();
+  state.heldSelectionText = state.extendedSelectionText || text;
+  if (!state.selectionAutoScrollWriting || !state.heldSelectionPosition) {
+    state.heldSelectionPosition = position ? {
+      start: {...position.start},
+      end: {...position.end},
+    } : null;
+  }
+}
+
+function restoreHeldTerminalSelection(state, {force = false} = {}) {
+  const position = state.heldSelectionPosition;
+  if (
+    !state.selectionHold
+    || !state.heldSelectionText
+    || !position
+    || (state.term.hasSelection() && !force)
+  ) return;
+  const length = (
+    (position.end.y - position.start.y) * state.term.cols
+    + position.end.x
+    - position.start.x
+  );
+  if (length > 0) {
+    state.term.select(position.start.x, position.start.y, length);
+  }
+}
+
+function restoreExactTerminalSelection(state, text, preferredPosition = null) {
+  if (!state?.term || !text) return false;
+  const trySelection = (column, row, length) => {
+    if (length <= 0) return false;
+    state.term.select(column, row, length);
+    return state.term.getSelection() === text;
+  };
+  if (preferredPosition) {
+    const preferredLength = (
+      (preferredPosition.end.y - preferredPosition.start.y) * state.term.cols
+      + preferredPosition.end.x
+      - preferredPosition.start.x
+    );
+    if (
+      trySelection(
+        preferredPosition.start.x,
+        preferredPosition.start.y,
+        preferredLength,
+      )
+    ) return true;
+  }
+  const lines = text.split("\n");
+  const firstLine = lines[0];
+  if (!firstLine || lines.length > state.term.rows) return false;
+  const buffer = state.term.buffer.active;
+  const firstRow = buffer.viewportY;
+  const finalRow = Math.min(buffer.length, firstRow + state.term.rows);
+  for (let row = firstRow; row < finalRow; row += 1) {
+    const rowText = buffer.getLine(row)?.translateToString(true) || "";
+    let column = rowText.indexOf(firstLine);
+    while (column >= 0) {
+      const length = (
+        (lines.length - 1) * state.term.cols
+        + lines.at(-1).length
+        - column
+      );
+      if (trySelection(column, row, length)) return true;
+      column = rowText.indexOf(firstLine, column + 1);
+    }
+  }
+  return false;
+}
+
+function scheduleHeldTerminalSelectionRestore(state) {
+  if (state.selectionRestoreScheduled) return;
+  state.selectionRestoreScheduled = true;
+  queueMicrotask(() => {
+    state.selectionRestoreScheduled = false;
+    restoreHeldTerminalSelection(state);
+    syncTerminalCopyButton(state);
+  });
+}
+
+function setTerminalCopyFeedback(state, text) {
+  if (state.workerId !== workerId) return;
+  clearTimeout(terminalCopyFeedbackTimer);
+  copySelection.textContent = text;
+  terminalCopyFeedbackTimer = window.setTimeout(() => {
+    if (state.workerId === workerId) copySelection.textContent = "Copy selection";
+  }, 1200);
+}
+
+async function copyTerminalSelection(state) {
+  const selectedText = terminalSelectionText(state);
+  if (!selectedText || state.copyPending) return;
+  const emulatorGeneration = state.emulatorGeneration;
+  state.copyPending = true;
+  syncTerminalCopyButton(state);
+  try {
+    await writeClipboardText(selectedText);
+    if (state.emulatorGeneration === emulatorGeneration) {
+      releaseTerminalSelection(state, {clearSelection: true});
+    }
+    setTerminalCopyFeedback(state, "Copied");
+  } catch (error) {
+    console.error("Could not copy terminal selection", error);
+    setTerminalCopyFeedback(state, "Copy failed");
+  } finally {
+    state.copyPending = false;
+    syncTerminalCopyButton(state);
+  }
+}
+
+function forwardTerminalInput(state, data) {
+  if (state.workerId !== workerId || state.host.hidden) {
+    debug("ignored input from inactive terminal", {
+      workerId: state.workerId,
+      selectedWorkerId: workerId,
+    });
+    return false;
+  }
+  const input = promptInput(state, data);
+  const sequence = ++state.inputSequence;
+  const message = {
+    type: "input",
+    worker_id: state.workerId,
+    sequence,
+    ...input,
+  };
+  state.pending.set(sequence, message);
+  if (
+    socket?.readyState === WebSocket.OPEN
+    && !state.replaying
+    && state.connectionGeneration === connectionGeneration
+  ) {
+    socket.send(JSON.stringify(message));
+    return true;
+  }
+  setStatus("taking control", "pending");
+  if (!socket || socket.readyState >= WebSocket.CLOSING) connect();
+  return false;
+}
+
+function installPrimaryDragSelection(state) {
+  const selectionService = state.term._core?._selectionService;
+  if (
+    !selectionService
+    || typeof selectionService.shouldForceSelection !== "function"
+  ) {
+    throw new Error("Bundled xterm selection service is unavailable");
+  }
+  const shouldForceSelection =
+    selectionService.shouldForceSelection.bind(selectionService);
+  selectionService.shouldForceSelection = (event) => (
+    event.button === 0 || shouldForceSelection(event)
+  );
+  const isActive = () => state.workerId === workerId && !state.host.hidden;
+  const forwardTerminalClick = (gesture) => {
+    if (
+      state.emulatorGeneration !== gesture.emulatorGeneration
+      || !state.term
+      || !state.term._core?.coreMouseService?.areMouseEventsActive
+    ) return;
+    const screen = state.host.querySelector(".xterm-screen");
+    const bounds = screen?.getBoundingClientRect();
+    if (!bounds?.width || !bounds.height) return;
+    const column = Math.max(
+      1,
+      Math.min(
+        state.term.cols,
+        Math.floor(
+          ((gesture.clientX - bounds.left) / bounds.width) * state.term.cols,
+        ) + 1,
+      ),
+    );
+    const row = Math.max(
+      1,
+      Math.min(
+        state.term.rows,
+        Math.floor(
+          ((gesture.clientY - bounds.top) / bounds.height) * state.term.rows,
+        ) + 1,
+      ),
+    );
+    const button = (gesture.ctrlKey ? 16 : 0) + (gesture.altKey ? 8 : 0);
+    forwardTerminalInput(
+      state,
+      `\x1b[<${button};${column};${row}M`
+      + `\x1b[<${button};${column};${row}m`,
+    );
+  };
+  let finishMouseSelection = null;
+  let cancelMouseSelection = null;
+  let trackMouseSelection = null;
+  let edgeScrollDirection = 0;
+  let edgeScrollActivationTimer = 0;
+  let edgeScrollTimer = 0;
+  let edgeScrollStep = null;
+  let selectionPointerAtEdge = false;
+  let lastEdgeScrollDirection = 0;
+  let lastMousePosition = null;
+  let movedBeyondThreshold = false;
+  let selectionWheelSettleTimer = 0;
+  let selectionWheelSettleToken = 0;
+  let selectionWheelActive = false;
+  let selectionWheelDirection = 0;
+  let returnSelectionText = "";
+  let returnSelectionPosition = null;
+  const waitForEdgeScroll = (milliseconds) => new Promise((resolve) => {
+    window.setTimeout(resolve, milliseconds);
+  });
+  const captureExtendedSelection = (direction) => {
+    const text = state.term?.getSelection();
+    if (!text) return;
+    if (
+      !state.extendedSelectionFragments.some((fragment) => fragment.text === text)
+    ) {
+      const position = state.term.getSelectionPosition?.();
+      state.extendedSelectionFragments.push({
+        text,
+        position: position ? {
+          start: {...position.start},
+          end: {...position.end},
+        } : null,
+      });
+    }
+    state.extendedSelectionText = direction < 0
+      ? mergeTerminalSelectionText(text, state.extendedSelectionText)
+      : mergeTerminalSelectionText(state.extendedSelectionText, text);
+    rememberTerminalSelection(state);
+    holdTerminalSelection(state);
+  };
+  const forwardSelectionWheel = (direction, pointer) => {
+    const screen = state.host.querySelector(".xterm-screen");
+    const bounds = screen?.getBoundingClientRect();
+    if (!bounds?.width || !bounds.height) return false;
+    const column = Math.max(
+      1,
+      Math.min(
+        state.term.cols,
+        Math.floor(
+          ((pointer.clientX - bounds.left) / bounds.width) * state.term.cols,
+        ) + 1,
+      ),
+    );
+    const row = direction < 0 ? 1 : state.term.rows;
+    const button = direction < 0 ? 64 : 65;
+    forwardTerminalInput(state, `\x1b[<${button};${column};${row}M`);
+    return true;
+  };
+  const stopEdgeScrollTimer = () => {
+    edgeScrollDirection = 0;
+    clearTimeout(edgeScrollActivationTimer);
+    clearInterval(edgeScrollTimer);
+    edgeScrollActivationTimer = 0;
+    edgeScrollTimer = 0;
+  };
+  const renewSelectionHold = () => {
+    const previousHold = state.selectionHold;
+    if (!previousHold) return;
+    state.selectionHold = null;
+    clearTimeout(state.selectionHoldTimer);
+    state.selectionHoldTimer = 0;
+    previousHold.resolve();
+    holdTerminalSelection(state);
+  };
+  const settleSelectionAutoScroll = (
+    direction,
+    {navigationOnly = false} = {},
+  ) => {
+    if (!state.selectionAutoScrollWriting) return;
+    if (navigationOnly && state.selectionNavigationText) {
+      state.selectionAutoScrollWriting = false;
+      let restored = false;
+      for (const fragment of state.selectionNavigationFragments) {
+        if (
+          restoreExactTerminalSelection(state, fragment.text, fragment.position)
+        ) {
+          const position = state.term.getSelectionPosition?.();
+          fragment.position = position ? {
+            start: {...position.start},
+            end: {...position.end},
+          } : null;
+          restored = true;
+          break;
+        }
+      }
+      state.selectionViewingOffscreen = !restored;
+      if (!restored) {
+        state.suppressSelectionRestore = true;
+        state.term.clearSelection();
+        state.suppressSelectionRestore = false;
+      }
+      state.heldSelectionText = state.selectionNavigationText;
+      renewSelectionHold();
+      syncTerminalCopyButton(state);
+      return;
+    }
+    restoreHeldTerminalSelection(state, {force: true});
+    captureExtendedSelection(direction);
+    state.selectionAutoScrollWriting = false;
+    rememberTerminalSelection(state);
+    renewSelectionHold();
+  };
+  const stopSelectionWheelSettle = () => {
+    clearTimeout(selectionWheelSettleTimer);
+    selectionWheelSettleTimer = 0;
+    selectionWheelSettleToken += 1;
+    selectionWheelActive = false;
+    selectionWheelDirection = 0;
+  };
+  const beginSelectionWheelNavigation = (direction) => {
+    clearTimeout(selectionWheelSettleTimer);
+    selectionWheelSettleTimer = 0;
+    selectionWheelSettleToken += 1;
+    selectionWheelActive = true;
+    selectionWheelDirection = direction;
+  };
+  const scheduleSelectionWheelSettle = (direction) => {
+    clearTimeout(selectionWheelSettleTimer);
+    const token = ++selectionWheelSettleToken;
+    const emulatorGeneration = state.emulatorGeneration;
+    selectionWheelSettleTimer = window.setTimeout(() => {
+      selectionWheelSettleTimer = 0;
+      const pendingWrites = state.writeChain;
+      void pendingWrites.then(() => {
+        if (
+          token !== selectionWheelSettleToken
+          || state.emulatorGeneration !== emulatorGeneration
+          || state.selectingWithMouse
+          || !state.term
+          || !state.selectionHold
+          || !isActive()
+        ) return;
+        selectionWheelActive = false;
+        selectionWheelDirection = 0;
+        settleSelectionAutoScroll(direction, {navigationOnly: true});
+      });
+    }, terminalSelectionWheelSettle);
+  };
+  state.selectionWriteObserver = () => {
+    if (selectionWheelActive && selectionWheelDirection) {
+      scheduleSelectionWheelSettle(selectionWheelDirection);
+    }
+  };
+  const runEdgeScrollStep = () => {
+    if (
+      !edgeScrollDirection
+      || edgeScrollStep
+      || !lastMousePosition
+      || !state.term
+      || !isActive()
+    ) return;
+    const direction = edgeScrollDirection;
+    const emulatorGeneration = state.emulatorGeneration;
+    const pointer = {...lastMousePosition};
+    edgeScrollStep = (async () => {
+      captureExtendedSelection(direction);
+      if (!state.extendedSelectionText) return;
+      state.selectionAutoScrollWriting = true;
+      state.selectionHold?.bypass();
+      if (!forwardSelectionWheel(direction, pointer)) {
+        settleSelectionAutoScroll(direction);
+        return;
+      }
+      await waitForEdgeScroll(terminalSelectionEdgeSettle);
+      await state.writeChain;
+      if (
+        state.emulatorGeneration !== emulatorGeneration
+        || !state.selectingWithMouse
+        || !state.term
+        || !isActive()
+      ) return;
+      restoreHeldTerminalSelection(state, {force: true});
+      captureExtendedSelection(direction);
+    })().finally(() => {
+      edgeScrollStep = null;
+    });
+  };
+  const setEdgeScrollDirection = (direction) => {
+    if (direction === edgeScrollDirection) return;
+    stopEdgeScrollTimer();
+    edgeScrollDirection = direction;
+    selectionPointerAtEdge = Boolean(direction);
+    if (!direction) return;
+    lastEdgeScrollDirection = direction;
+    const activateEdgeScroll = () => {
+      edgeScrollActivationTimer = 0;
+      runEdgeScrollStep();
+      edgeScrollTimer = window.setInterval(
+        runEdgeScrollStep,
+        terminalSelectionEdgeInterval,
+      );
+    };
+    if (state.selectionAutoScrollWriting) {
+      activateEdgeScroll();
+    } else {
+      edgeScrollActivationTimer = window.setTimeout(
+        activateEdgeScroll,
+        terminalSelectionEdgeActivation,
+      );
+    }
+  };
+  const originSelectionIsVisible = () => {
+    const origin = (
+      returnSelectionText
+      || state.extendedSelectionFragments[0]?.text
+      || ""
+    );
+    const marker = origin.split("\n").reduce(
+      (longest, line) => line.length > longest.length ? line : longest,
+      "",
+    );
+    return Boolean(marker && terminalBufferText(state.term).includes(marker));
+  };
+  const settleEdgeScroll = ({preserveCurrentSelection = false} = {}) => {
+    stopEdgeScrollTimer();
+    if (preserveCurrentSelection) {
+      const text = state.term.getSelection();
+      const position = state.term.getSelectionPosition?.();
+      state.selectionAutoScrollWriting = false;
+      state.extendedSelectionText = text;
+      state.extendedSelectionFragments = text ? [{
+        text,
+        position: position ? {
+          start: {...position.start},
+          end: {...position.end},
+        } : null,
+      }] : [];
+      state.heldSelectionText = text;
+      state.heldSelectionPosition = position ? {
+        start: {...position.start},
+        end: {...position.end},
+      } : null;
+      renewSelectionHold();
+      syncTerminalCopyButton(state);
+      return;
+    }
+    settleSelectionAutoScroll(lastEdgeScrollDirection || 1);
+  };
+  const restoreReturnSelection = () => restoreExactTerminalSelection(
+    state,
+    returnSelectionText,
+    returnSelectionPosition,
+  );
+  const detachMouseFinish = () => {
+    if (!finishMouseSelection) return;
+    window.removeEventListener("mouseup", finishMouseSelection);
+    window.removeEventListener("blur", cancelMouseSelection);
+    window.removeEventListener("mousemove", trackMouseSelection, true);
+    stopEdgeScrollTimer();
+    finishMouseSelection = null;
+    cancelMouseSelection = null;
+    trackMouseSelection = null;
+  };
+  const onMouseDown = (event) => {
+    if (event.button !== 0) return;
+    detachMouseFinish();
+    stopSelectionWheelSettle();
+    if (state.selectionAutoScrollWriting) {
+      state.selectionAutoScrollWriting = false;
+      renewSelectionHold();
+    }
+    state.selectingWithMouse = true;
+    state.heldSelectionText = "";
+    state.heldSelectionPosition = null;
+    state.extendedSelectionText = "";
+    state.extendedSelectionFragments = [];
+    state.selectionNavigationText = "";
+    state.selectionNavigationFragments = [];
+    state.selectionViewingOffscreen = false;
+    state.selectionAutoScrollWriting = false;
+    selectionPointerAtEdge = false;
+    returnSelectionText = "";
+    returnSelectionPosition = null;
+    lastMousePosition = null;
+    lastEdgeScrollDirection = 0;
+    movedBeyondThreshold = false;
+    holdTerminalSelection(state);
+    const gesture = {
+      clientX: event.clientX,
+      clientY: event.clientY,
+      ctrlKey: event.ctrlKey,
+      altKey: event.altKey,
+      shiftKey: event.shiftKey,
+      detail: event.detail,
+      emulatorGeneration: state.emulatorGeneration,
+    };
+    trackMouseSelection = (moveEvent) => {
+      lastMousePosition = {
+        clientX: moveEvent.clientX,
+        clientY: moveEvent.clientY,
+      };
+      const distance = Math.hypot(
+        moveEvent.clientX - gesture.clientX,
+        moveEvent.clientY - gesture.clientY,
+      );
+      if (distance >= terminalSelectionDragThreshold) movedBeyondThreshold = true;
+      if (
+        distance < terminalSelectionDragThreshold
+        || !state.term?._core?.coreMouseService?.areMouseEventsActive
+      ) {
+        setEdgeScrollDirection(0);
+        return;
+      }
+      const screen = state.host.querySelector(".xterm-screen");
+      const bounds = screen?.getBoundingClientRect();
+      const verticalDistance = moveEvent.clientY - gesture.clientY;
+      if (
+        !returnSelectionText
+        && !state.selectionAutoScrollWriting
+        && Math.abs(verticalDistance) >= terminalSelectionEdgeIntent
+      ) {
+        const text = state.term.getSelection();
+        const position = state.term.getSelectionPosition?.();
+        if (text) {
+          returnSelectionText = text;
+          returnSelectionPosition = position ? {
+            start: {...position.start},
+            end: {...position.end},
+          } : null;
+        }
+      }
+      if (!bounds) {
+        setEdgeScrollDirection(0);
+      } else if (
+        moveEvent.clientY <= bounds.top + terminalSelectionEdgeSize
+        && (
+          verticalDistance <= -terminalSelectionEdgeIntent
+          || moveEvent.clientY < bounds.top
+        )
+      ) {
+        setEdgeScrollDirection(-1);
+      } else if (
+        moveEvent.clientY >= bounds.bottom - terminalSelectionEdgeSize
+        && (
+          verticalDistance >= terminalSelectionEdgeIntent
+          || moveEvent.clientY > bounds.bottom
+        )
+      ) {
+        setEdgeScrollDirection(1);
+      } else {
+        setEdgeScrollDirection(0);
+      }
+      if (
+        !selectionPointerAtEdge
+        && state.selectionAutoScrollWriting
+        && originSelectionIsVisible()
+      ) {
+        moveEvent.preventDefault();
+        moveEvent.stopPropagation();
+        restoreReturnSelection();
+      }
+    };
+    finishMouseSelection = (finishEvent) => {
+      detachMouseFinish();
+      const selectionGesture = (
+        movedBeyondThreshold
+        || Math.hypot(
+          finishEvent.clientX - gesture.clientX,
+          finishEvent.clientY - gesture.clientY,
+        ) >= terminalSelectionDragThreshold
+        || gesture.detail > 1
+        || gesture.shiftKey
+      );
+      if (
+        state.selectionAutoScrollWriting
+        && !selectionPointerAtEdge
+        && originSelectionIsVisible()
+      ) {
+        restoreReturnSelection();
+      }
+      const preserveCurrentSelection = Boolean(
+        state.selectionAutoScrollWriting
+        && !selectionPointerAtEdge
+        && state.term?.hasSelection()
+        && originSelectionIsVisible()
+      );
+      settleEdgeScroll({preserveCurrentSelection});
+      state.selectingWithMouse = false;
+      window.setTimeout(() => {
+        if (selectionGesture && state.term?.hasSelection()) {
+          rememberTerminalSelection(state);
+          holdTerminalSelection(state);
+        } else if (selectionGesture && state.heldSelectionText) {
+          holdTerminalSelection(state);
+          restoreHeldTerminalSelection(state);
+        } else {
+          releaseTerminalSelection(state, {clearSelection: true});
+          if (!selectionGesture) forwardTerminalClick(gesture);
+        }
+      }, 0);
+    };
+    cancelMouseSelection = () => {
+      detachMouseFinish();
+      stopSelectionWheelSettle();
+      state.selectingWithMouse = false;
+      state.selectionAutoScrollWriting = false;
+      releaseTerminalSelection(state, {clearSelection: true});
+    };
+    window.addEventListener("mousemove", trackMouseSelection, true);
+    window.addEventListener("mouseup", finishMouseSelection);
+    window.addEventListener("blur", cancelMouseSelection);
+  };
+  const onPaste = () => {
+    stopSelectionWheelSettle();
+    state.selectingWithMouse = false;
+    releaseTerminalSelection(state, {clearSelection: true});
+  };
+  const onSelectionWheel = (event) => {
+    if (
+      event.ctrlKey
+      || !event.deltaY
+      || !isActive()
+      || !state.selectionHold
+      || !terminalSelectionText(state)
+      || !state.term?._core?.coreMouseService?.areMouseEventsActive
+    ) return;
+    const screen = state.host.querySelector(".xterm-screen");
+    const bounds = screen?.getBoundingClientRect();
+    const targetInsideTerminal = state.host.contains(event.target);
+    const pointerNearTerminal = Boolean(
+      bounds
+      && event.clientX >= bounds.left
+      && event.clientX <= bounds.right
+      && event.clientY >= bounds.top - terminalSelectionEdgeSize * 2
+      && event.clientY <= bounds.bottom + terminalSelectionEdgeSize * 2
+    );
+    if (!targetInsideTerminal && !pointerNearTerminal) return;
+    const scrollAmount = (
+      state.term._core?.viewport?.getLinesScrolled?.(event) ?? event.deltaY
+    );
+    if (!scrollAmount) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const direction = scrollAmount < 0 ? -1 : 1;
+    const navigationOnly = !state.selectingWithMouse;
+    if (navigationOnly) {
+      if (!state.selectionNavigationText) {
+        state.selectionNavigationText = terminalSelectionText(state);
+        state.selectionNavigationFragments = (
+          state.extendedSelectionFragments.map((fragment) => ({
+            text: fragment.text,
+            position: fragment.position ? {
+              start: {...fragment.position.start},
+              end: {...fragment.position.end},
+            } : null,
+          }))
+        );
+        if (
+          !state.selectionNavigationFragments.length
+          && state.selectionNavigationText
+        ) {
+          state.selectionNavigationFragments.push({
+            text: state.selectionNavigationText,
+            position: state.heldSelectionPosition ? {
+              start: {...state.heldSelectionPosition.start},
+              end: {...state.heldSelectionPosition.end},
+            } : null,
+          });
+        }
+      }
+      const visibleSelection = state.term.getSelection();
+      if (
+        visibleSelection
+        && !state.selectionNavigationFragments.some(
+          (fragment) => fragment.text === visibleSelection,
+        )
+      ) {
+        const position = state.term.getSelectionPosition?.();
+        state.selectionNavigationFragments.push({
+          text: visibleSelection,
+          position: position ? {
+            start: {...position.start},
+            end: {...position.end},
+          } : null,
+        });
+      }
+      state.heldSelectionText = state.selectionNavigationText;
+    } else {
+      captureExtendedSelection(direction);
+      if (!state.extendedSelectionText) return;
+    }
+    state.selectionAutoScrollWriting = true;
+    state.selectionHold?.bypass();
+    if (state.selectingWithMouse) {
+      stopEdgeScrollTimer();
+      lastEdgeScrollDirection = direction;
+    }
+    if (!forwardSelectionWheel(direction, event)) {
+      settleSelectionAutoScroll(direction, {navigationOnly});
+      return;
+    }
+    if (!state.selectingWithMouse) beginSelectionWheelNavigation(direction);
+  };
+  state.host.addEventListener("mousedown", onMouseDown, true);
+  state.host.addEventListener("paste", onPaste, true);
+  window.addEventListener("wheel", onSelectionWheel, {
+    capture: true,
+    passive: false,
+  });
+  state.primarySelectionCleanup = () => {
+    detachMouseFinish();
+    stopSelectionWheelSettle();
+    state.selectionAutoScrollWriting = false;
+    state.selectionWriteObserver = null;
+    state.host.removeEventListener("mousedown", onMouseDown, true);
+    state.host.removeEventListener("paste", onPaste, true);
+    window.removeEventListener("wheel", onSelectionWheel, true);
+  };
+}
+
+function installTerminalHandlers(state) {
+  state.term.attachCustomKeyEventHandler((event) => {
+    if (
+      (event.metaKey || event.ctrlKey)
+      && event.key.toLowerCase() === "c"
+      && terminalSelectionText(state)
+    ) {
+      void copyTerminalSelection(state);
+      return false;
+    }
+    const pasteShortcut = (
+      event.ctrlKey
+      && !event.altKey
+      && !event.metaKey
+      && event.key.toLowerCase() === "v"
+    ) || (
+      event.shiftKey
+      && !event.ctrlKey
+      && !event.altKey
+      && !event.metaKey
+      && event.key === "Insert"
+    );
+    if (pasteShortcut) {
+      state.selectingWithMouse = false;
+      releaseTerminalSelection(state, {clearSelection: true});
+      return false;
+    }
+    if (
+      event.type === "keydown"
+      && !["Alt", "Control", "Meta", "Shift"].includes(event.key)
+    ) {
+      state.selectingWithMouse = false;
+      releaseTerminalSelection(state, {clearSelection: true});
+    }
+    return true;
+  });
+  state.term.onSelectionChange(() => {
+    if (state.suppressSelectionRestore) {
+      syncTerminalCopyButton(state);
+      return;
+    }
+    if (state.term.hasSelection()) {
+      rememberTerminalSelection(state);
+      holdTerminalSelection(state);
+    } else if (state.selectingWithMouse) {
+      holdTerminalSelection(state);
+    } else if (state.selectionNavigationText && state.selectionHold) {
+      state.heldSelectionText = state.selectionNavigationText;
+      holdTerminalSelection(state);
+    } else if (state.selectionHold && state.heldSelectionText) {
+      scheduleHeldTerminalSelectionRestore(state);
+    } else {
+      releaseTerminalSelection(state);
+    }
+    syncTerminalCopyButton(state);
+  });
+  state.term.onScroll(() => {
+    captureTerminalViewport(state);
+    debug("scroll", state.workerId, state.term.buffer.active.viewportY);
+  });
+  state.term.onData((data) => forwardTerminalInput(state, data));
+}
+
+function createState(targetWorkerId) {
+  const host = document.createElement("div");
+  host.className = "terminal-buffer";
+  host.dataset.workerId = targetWorkerId;
+  host.hidden = true;
+  terminalElement.append(host);
+  const term = new Terminal(terminalOptions());
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(host);
+  const state = {
+    workerId: targetWorkerId,
+    host,
+    term,
+    fit,
+    streamId: null,
+    offset: 0,
+    replaying: true,
+    pending: new Map(),
+    inputSequence: 0,
+    promptDirty: false,
+    promptText: "",
+    promptKnown: true,
+    bracketedPaste: false,
+    writeChain: Promise.resolve(),
+    connectionGeneration: 0,
+    emulatorGeneration: 1,
+    followingOutput: true,
+    viewportY: 0,
+    restoringScroll: false,
+    pendingWriteBytes: 0,
+    selectionHold: null,
+    selectionHoldTimer: 0,
+    selectingWithMouse: false,
+    selectionRestoreScheduled: false,
+    heldSelectionText: "",
+    heldSelectionPosition: null,
+    extendedSelectionText: "",
+    extendedSelectionFragments: [],
+    selectionNavigationText: "",
+    selectionNavigationFragments: [],
+    selectionViewingOffscreen: false,
+    suppressSelectionRestore: false,
+    selectionAutoScrollWriting: false,
+    selectionWriteObserver: null,
+    primarySelectionCleanup: null,
+    copyPending: false,
+  };
+  installPrimaryDragSelection(state);
+  installTerminalHandlers(state);
+  states.set(targetWorkerId, state);
+  return state;
+}
+
+function stateFor(targetWorkerId) {
+  return states.get(targetWorkerId) || createState(targetWorkerId);
+}
+
+function fitState(state, notify = true) {
+  if (state.host.hidden) return;
+  try {
+    captureTerminalViewport(state);
+    state.fit.fit();
+    restoreTerminalViewport(state);
+    if (notify && socket?.readyState === WebSocket.OPEN && workerId === state.workerId) {
+      socket.send(JSON.stringify({
+        type: "resize",
+        worker_id: state.workerId,
+        rows: state.term.rows,
+        cols: state.term.cols,
+      }));
+    }
+  } catch (error) {
+    debug("fit failed", error);
+  }
+}
+
+function activateState(targetWorkerId) {
+  for (const state of states.values()) {
+    if (!state.host.hidden) captureTerminalViewport(state);
+    if (state.workerId !== targetWorkerId) {
+      state.selectingWithMouse = false;
+      releaseTerminalSelection(state, {clearSelection: true});
+    }
+    state.host.hidden = state.workerId !== targetWorkerId;
+    state.host.inert = state.workerId !== targetWorkerId;
+  }
+  const state = stateFor(targetWorkerId);
+  state.host.hidden = false;
+  state.host.inert = false;
+  clearTimeout(terminalCopyFeedbackTimer);
+  copySelection.textContent = "Copy selection";
+  syncTerminalCopyButton(state);
+  requestAnimationFrame(() => {
+    fitState(state);
+    restoreTerminalViewport(state);
+    state.term.focus();
+  });
+  return state;
+}
+
+function resetState(state) {
+  state.selectingWithMouse = false;
+  releaseTerminalSelection(state, {clearSelection: true});
+  state.term.reset();
+  state.streamId = null;
+  state.offset = 0;
+  state.writeChain = Promise.resolve();
+  state.pendingWriteBytes = 0;
+  state.followingOutput = true;
+  state.viewportY = 0;
+  state.emulatorGeneration += 1;
+}
+
+function queueWrite(state, bytes) {
+  const emulatorGeneration = state.emulatorGeneration;
+  const writeBytes = bytes.byteLength ?? bytes.length ?? 0;
+  const allowDuringSelection = state.selectionAutoScrollWriting;
+  state.pendingWriteBytes += writeBytes;
+  if (
+    state.selectionHold
+    && state.pendingWriteBytes > terminalSelectionMaxDeferredBytes
+  ) {
+    state.selectingWithMouse = false;
+    releaseTerminalSelection(state, {clearSelection: true});
+  }
+  state.writeChain = state.writeChain.then(async () => {
+    const hold = state.selectionHold;
+    if (hold && !allowDuringSelection) {
+      await Promise.race([hold.promise, hold.bypassPromise]);
+    }
+    await new Promise((resolve) => {
+      if (state.emulatorGeneration !== emulatorGeneration || !state.term) {
+        resolve();
+        return;
+      }
+      state.term.write(bytes, () => {
+        state.selectionWriteObserver?.();
+        resolve();
+      });
+    });
+  }).finally(() => {
+    state.pendingWriteBytes = Math.max(0, state.pendingWriteBytes - writeBytes);
+  });
+  return state.writeChain;
+}
+
+function sendPending(state) {
+  for (const message of [...state.pending.values()].sort((a, b) => a.sequence - b.sequence)) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+function acknowledgeInput(payload, expectedWorkerId) {
+  const acknowledgedWorkerId = String(payload.worker_id || expectedWorkerId || "");
+  if (!acknowledgedWorkerId || acknowledgedWorkerId !== expectedWorkerId) return;
+  states.get(acknowledgedWorkerId)?.pending.delete(Number(payload.sequence));
+  if (payload.direct_activity || payload.direct_cancelled) void refreshState();
+}
+
+function connect() {
+  clearTimeout(reconnectTimer);
+  if (document.hidden) return;
+  const state = activateState(workerId);
+  connectionGeneration += 1;
+  const generation = connectionGeneration;
+  state.connectionGeneration = generation;
+  if (socket) socket.close();
+  setStatus("connecting", "pending");
+  state.replaying = true;
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  const query = new URLSearchParams({client_id: clientId});
+  if (state.streamId) {
+    query.set("stream_id", state.streamId);
+    query.set("offset", String(state.offset));
+  }
+  const current = new WebSocket(
+    `${protocol}://${location.host}/ws/agents/terminal/${encodeURIComponent(workerId)}?${query}`,
+  );
+  current.binaryType = "arraybuffer";
+  socket = current;
+  const isCurrent = () => (
+    socket === current
+    && generation === connectionGeneration
+    && state.workerId === workerId
+  );
+  current.addEventListener("open", () => {
+    if (!isCurrent()) return current.close();
+    setStatus("synchronizing", "pending");
+    fitState(state);
+  });
+  current.addEventListener("message", async (event) => {
+    if (!isCurrent()) {
+      if (typeof event.data === "string") {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.type === "input_ack") {
+            acknowledgeInput(payload, state.workerId);
+          }
+        } catch {
+          // Stale non-acknowledgement frames leave with their connection.
+        }
+      }
+      return;
+    }
+    if (event.data instanceof ArrayBuffer) {
+      state.offset += event.data.byteLength;
+      await queueWrite(state, new Uint8Array(event.data));
+      return;
+    }
+    let payload;
+    try {
+      payload = JSON.parse(event.data);
+    } catch {
+      current.close(4410);
+      return;
+    }
+    if (payload.type === "terminal_stream") {
+      if (payload.reset) {
+        resetState(state);
+      } else if (
+        payload.stream_id !== state.streamId
+        || Number(payload.offset) !== state.offset
+      ) {
+        resetState(state);
+        current.close(4410);
+        return;
+      }
+      state.streamId = payload.stream_id;
+      state.offset = Number(payload.offset);
+      return;
+    }
+    if (payload.type === "terminal_replay_end") {
+      if (payload.stream_id !== state.streamId || Number(payload.offset) !== state.offset) {
+        resetState(state);
+        current.close(4410);
+        return;
+      }
+      await state.writeChain;
+      if (!isCurrent()) return;
+      state.replaying = false;
+      sendPending(state);
+      fitState(state);
+      restoreTerminalViewport(state);
+      setStatus("connected", "running");
+      return;
+    }
+    if (payload.type === "input_ack" && String(payload.worker_id) === state.workerId) {
+      acknowledgeInput(payload, state.workerId);
+    }
+  });
+  current.addEventListener("close", (event) => {
+    if (!isCurrent()) return;
+    socket = null;
+    if (event.code === 4409) {
+      setStatus("open in another tab", "pending");
+      return;
+    }
+    if (!document.hidden) {
+      setStatus("reconnecting", "pending");
+      reconnectTimer = setTimeout(connect, 1000);
+    }
+  });
+  current.addEventListener("error", () => {
+    if (isCurrent()) setStatus("connection error", "failed");
+  });
+}
+
+function switchWorker(targetWorkerId, {push = true} = {}) {
+  if (!workers.has(targetWorkerId)) return false;
+  workerId = targetWorkerId;
+  const worker = workers.get(workerId);
+  terminalSessionName.textContent = worker.display_name;
+  terminalSessionId.textContent = worker.copilot_session_id;
+  retireWorker.hidden = worker.role === "manager";
+  retireWorker.disabled = !["idle", "blocked"].includes(worker.state)
+    || Boolean(worker.current_task_id || worker.activity_kind || worker.direct_submitted_at);
+  document.querySelectorAll(".session-item").forEach((item) => {
+    item.classList.toggle("selected", item.dataset.workerId === workerId);
+  });
+  savePreference("selectedWorker", workerId);
+  if (push) {
+    const url = new URL(location.href);
+    url.searchParams.set("worker", workerId);
+    history.pushState({workerId}, "", `${url.pathname}${url.search}`);
+  }
+  connect();
+  return true;
+}
+
+function renderSessions(state) {
+  workers = new Map(state.workers.map((worker) => [worker.id, worker]));
+  sessionCount.textContent = `${state.workers.length}/${state.max_sessions}`;
+  maximumWorkers = state.max_workers;
+  sessionList.innerHTML = state.workers.map((worker) => `
+    <a href="/?worker=${encodeURIComponent(worker.id)}"
+       class="session-item${worker.id === workerId ? " selected" : ""}"
+       data-worker-id="${escapeHtml(worker.id)}" data-role="${escapeHtml(worker.role)}">
+      <span class="session-copy">
+        <strong>${escapeHtml(worker.display_name)}</strong>
+        <small class="session-activity">${escapeHtml(worker.activity_label || worker.state)}</small>
+      </span>
+      <span class="status ${escapeHtml(worker.state)}">${escapeHtml(worker.state.replaceAll("_", " "))}</span>
+    </a>`).join("");
+  const worker = workers.get(workerId);
+  if (worker) {
+    terminalSessionName.textContent = worker.display_name;
+    terminalSessionId.textContent = worker.copilot_session_id;
+    retireWorker.hidden = worker.role === "manager";
+    retireWorker.disabled = !["idle", "blocked"].includes(worker.state)
+      || Boolean(worker.current_task_id || worker.activity_kind || worker.direct_submitted_at);
+  } else if (state.manager) {
+    switchWorker(state.manager.id);
+  }
+  addWorker.disabled =
+    state.workers.filter((worker) => worker.role === "worker").length >= state.max_workers;
+}
+
+function renderWork(state) {
+  activeWorkCount.textContent = state.active_work.length;
+  activeWork.innerHTML = state.active_work.length
+    ? state.active_work.map((item) => `
+      <article class="work-item" data-work-key="${escapeHtml(item.key)}">
+        <div class="item-heading">
+          <span class="status ${escapeHtml(item.status)}">${escapeHtml(item.status_label)}</span>
+          <strong>${escapeHtml(item.title)}</strong>
+        </div>
+        ${item.context ? `<p>${escapeHtml(item.context)}</p>` : ""}
+        <small>${escapeHtml(item.worker_name)}</small>
+        ${item.action_url ? `<a href="${escapeHtml(item.action_url)}">${escapeHtml(item.action_label)}</a>` : ""}
+      </article>`).join("")
+    : '<p class="empty-state">No active delegated work.</p>';
+}
+
+function resultBody(task) {
+  return task.result?.response || task.result?.error || "";
+}
+
+function renderResults(results, summary) {
+  resultCount.textContent = summary.total;
+  resultsList.innerHTML = results.length
+    ? results.map((task) => `
+      <article class="result-item${task.result?.viewed_at ? " viewed" : ""}" data-result-id="${escapeHtml(task.id)}">
+        <div class="item-heading">
+          <span class="status ${escapeHtml(task.status)}">${escapeHtml(task.status.replaceAll("_", " "))}</span>
+          <strong>${escapeHtml(task.title)}</strong>
+        </div>
+        <p>${escapeHtml(resultBody(task))}</p>
+        <small>${escapeHtml(task.worker_display_name || "worker")}</small>
+        <div class="item-actions">
+          <button type="button" data-result-action="view" data-task-id="${escapeHtml(task.id)}">View</button>
+          <button type="button" data-result-action="manager" data-task-id="${escapeHtml(task.id)}">Send to Manager</button>
+          <button type="button" data-result-action="clear" data-task-id="${escapeHtml(task.id)}">Clear</button>
+        </div>
+      </article>`).join("")
+    : '<p class="empty-state">No worker results yet.</p>';
+}
+
+function renderMemory(memory) {
+  const pressure = document.getElementById("memory-pressure");
+  pressure.textContent = memory.pressure;
+  pressure.className = `status ${memory.pressure}`;
+  document.getElementById("memory-report").innerHTML = `
+    <dt>Used</dt><dd>${memory.used_percent}%</dd>
+    <dt>Available</dt><dd>${formatBytes(memory.available_bytes)}</dd>
+    <dt>Hub sessions</dt><dd>${formatBytes(memory.hub_rss_bytes)}</dd>
+    <dt>Swap used</dt><dd>${formatBytes(memory.swap_used_bytes)}</dd>`;
+}
+
+function formatBytes(value) {
+  const amount = Number(value || 0);
+  if (amount < 1024) return `${amount} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let current = amount;
+  let unit = -1;
+  do {
+    current /= 1024;
+    unit += 1;
+  } while (current >= 1024 && unit < units.length - 1);
+  return `${current.toFixed(current >= 10 ? 1 : 2)} ${units[unit]}`;
+}
+
+document.querySelectorAll("[data-bytes]").forEach((element) => {
+  element.textContent = formatBytes(element.dataset.bytes);
+});
+
+async function refreshResults() {
+  const response = await fetch("/api/agents/results", {cache: "no-store"});
+  if (!response.ok) throw new Error("Could not refresh results");
+  const payload = await response.json();
+  renderResults(payload.results, payload.summary);
+}
+
+async function refreshState() {
+  try {
+    const response = await fetch("/api/agents/state?compact=true", {cache: "no-store"});
+    if (!response.ok) throw new Error("Hub state request failed");
+    const state = await response.json();
+    renderSessions(state);
+    renderWork(state);
+    renderMemory(state.memory);
+    if (Number(resultCount.textContent) !== state.result_summary.total) {
+      await refreshResults();
+    }
+    return state;
+  } catch (error) {
+    setStatus("disconnected", "failed");
+    debug("state refresh failed", error);
+    return null;
+  }
+}
+
+sessionList.addEventListener("click", (event) => {
+  const item = event.target.closest(".session-item[data-worker-id]");
+  if (!item) return;
+  event.preventDefault();
+  switchWorker(item.dataset.workerId);
+});
+
+copySelection.addEventListener("click", () => {
+  void copyTerminalSelection(stateFor(workerId));
+});
+
+document.addEventListener("pointerdown", (event) => {
+  const state = states.get(workerId);
+  if (
+    !state?.selectionHold
+    || state.host.contains(event.target)
+    || copySelection.contains(event.target)
+  ) return;
+  state.selectingWithMouse = false;
+  releaseTerminalSelection(state, {clearSelection: true});
+}, true);
+
+reconnectTerminal.addEventListener("click", () => {
+  const state = states.get(workerId);
+  if (state) {
+    state.selectingWithMouse = false;
+    releaseTerminalSelection(state, {clearSelection: true});
+  }
+  connect();
+});
+
+retireWorker.addEventListener("click", async () => {
+  const worker = workers.get(workerId);
+  if (!worker || worker.role !== "worker") return;
+  if (!window.confirm(`Retire ${worker.display_name}? Its history will be preserved.`)) return;
+  retireWorker.disabled = true;
+  const response = await fetch(`/api/agents/workers/${encodeURIComponent(worker.id)}`, {
+    method: "DELETE",
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    sessionFeedback.hidden = false;
+    sessionFeedback.textContent = payload.detail || "Could not retire worker";
+  }
+  await refreshState();
+});
+
+addWorker.addEventListener("click", async () => {
+  addWorker.disabled = true;
+  const response = await fetch("/api/agents/workers", {method: "POST"});
+  const payload = await response.json();
+  if (!response.ok) {
+    sessionFeedback.hidden = false;
+    sessionFeedback.textContent = payload.detail || "Could not add worker";
+    await refreshState();
+    return;
+  }
+  await refreshState();
+  switchWorker(payload.id);
+});
+
+settingsToggle.addEventListener("click", () => {
+  settingsPanel.hidden = !settingsPanel.hidden;
+  settingsToggle.setAttribute("aria-expanded", String(!settingsPanel.hidden));
+  workerLimit.value = maximumWorkers;
+});
+
+cancelWorkerLimit.addEventListener("click", () => {
+  settingsPanel.hidden = true;
+  settingsToggle.setAttribute("aria-expanded", "false");
+});
+
+saveWorkerLimit.addEventListener("click", async () => {
+  const response = await fetch("/api/agents/config", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({max_workers: Number(workerLimit.value)}),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    sessionFeedback.hidden = false;
+    sessionFeedback.textContent = payload.detail || "Could not save worker limit";
+    return;
+  }
+  maximumWorkers = payload.max_workers;
+  workerLimitHelp.textContent =
+    `${payload.max_workers} workers + 1 Manager = ${payload.max_sessions} total sessions.`;
+  settingsPanel.hidden = true;
+  settingsToggle.setAttribute("aria-expanded", "false");
+  await refreshState();
+});
+
+resultsList.addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-result-action]");
+  if (!button) return;
+  const taskId = button.dataset.taskId;
+  button.disabled = true;
+  resultFeedback.hidden = true;
+  try {
+    if (button.dataset.resultAction === "view") {
+      const response = await fetch(`/api/agents/tasks/${encodeURIComponent(taskId)}`, {
+        cache: "no-store",
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Could not load result");
+      await fetch(`/api/agents/tasks/${encodeURIComponent(taskId)}/view-result`, {
+        method: "POST",
+      });
+      resultDialogTitle.textContent = payload.task.title;
+      resultDialogContent.textContent = resultBody(payload.task);
+      resultDialog.showModal();
+    } else if (button.dataset.resultAction === "manager") {
+      const response = await fetch(
+        `/api/agents/tasks/${encodeURIComponent(taskId)}/send-to-manager`,
+        {method: "POST"},
+      );
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Could not send result");
+      resultFeedback.hidden = false;
+      resultFeedback.textContent = "Result queued for Manager delivery.";
+    } else {
+      const response = await fetch(
+        `/api/agents/tasks/${encodeURIComponent(taskId)}/clear-result`,
+        {method: "POST"},
+      );
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Could not clear result");
+    }
+    await refreshResults();
+  } catch (error) {
+    resultFeedback.hidden = false;
+    resultFeedback.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+window.addEventListener("popstate", () => {
+  const selected = new URL(location.href).searchParams.get("worker");
+  if (selected && workers.has(selected)) switchWorker(selected, {push: false});
+});
+
+window.addEventListener("resize", () => fitState(stateFor(workerId)));
+new ResizeObserver(() => fitState(stateFor(workerId))).observe(terminalElement);
+document.addEventListener("visibilitychange", () => {
+  clearTimeout(reconnectTimer);
+  clearTimeout(pollTimer);
+  if (document.hidden) {
+    connectionGeneration += 1;
+    if (socket) socket.close();
+    setStatus("paused", "pending");
+  } else {
+    connect();
+    schedulePoll(0);
+  }
+});
+
+function schedulePoll(delay = 2000) {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    if (!document.hidden) await refreshState();
+    schedulePoll();
+  }, delay);
+}
+
+window.__copilotHubTerminalDebug = {
+  enabled: debugEnabled,
+  activeText: () => terminalBufferText(states.get(workerId)?.term),
+  activeSnapshot: () => {
+    const state = stateFor(workerId);
+    const buffer = state.term.buffer.active;
+    return {
+      workerId,
+      streamId: state.streamId,
+      offset: state.offset,
+      viewportY: buffer.viewportY,
+      baseY: buffer.baseY,
+      followingOutput: state.followingOutput,
+      cols: state.term.cols,
+      rows: state.term.rows,
+      selection: state.term.getSelection(),
+      hasSelection: state.term.hasSelection(),
+      selectionHeld: Boolean(state.selectionHold),
+      cachedSelection: state.heldSelectionText,
+      extendedSelection: state.extendedSelectionText,
+      navigationSelection: state.selectionNavigationText,
+      selectionViewingOffscreen: state.selectionViewingOffscreen,
+      selectionAutoScrolling: state.selectionAutoScrollWriting,
+      pendingWriteBytes: state.pendingWriteBytes,
+      mouseEventsActive: Boolean(
+        state.term._core?.coreMouseService?.areMouseEventsActive,
+      ),
+      pendingInputs: state.pending.size,
+      promptDirty: state.promptDirty,
+      promptKnown: state.promptKnown,
+      replaying: state.replaying,
+      socketReadyState: socket?.readyState ?? WebSocket.CLOSED,
+      stateCount: states.size,
+      connectionGeneration,
+    };
+  },
+  sessionSnapshot: (targetWorkerId) => {
+    const state = states.get(targetWorkerId);
+    return state ? {
+      streamId: state.streamId,
+      offset: state.offset,
+      viewportY: state.term.buffer.active.viewportY,
+      baseY: state.term.buffer.active.baseY,
+      followingOutput: state.followingOutput,
+      selection: state.term.getSelection(),
+      text: terminalBufferText(state.term),
+    } : null;
+  },
+  scrollActive: (lines) => {
+    const state = stateFor(workerId);
+    state.term.scrollLines(lines);
+    captureTerminalViewport(state);
+    return window.__copilotHubTerminalDebug.activeSnapshot();
+  },
+  clearActiveSelection: () => {
+    stateFor(workerId).term.clearSelection();
+    return window.__copilotHubTerminalDebug.activeSnapshot();
+  },
+};
+
+const storedWorker = readPreference("selectedWorker");
+if (
+  !new URL(location.href).searchParams.has("worker")
+  && storedWorker
+  && workers.has(storedWorker)
+) {
+  workerId = storedWorker;
+}
+switchWorker(workerId, {push: false});
+schedulePoll();
+</script>
+{% endblock %}
