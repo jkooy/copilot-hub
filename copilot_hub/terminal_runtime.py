@@ -13,7 +13,6 @@ import re
 import select
 import shutil
 import signal
-import sqlite3
 import struct
 import subprocess
 import termios
@@ -26,15 +25,18 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from . import claude_events, session_prompts
 from .config import Settings
 from .db import Repository, utc_now
 from .presentation import sanitize_context_text
 
 logger = logging.getLogger(__name__)
+
+MANAGER_DISALLOWED_TOOLS = ("Edit", "Write", "NotebookEdit")
 
 
 @dataclass
@@ -50,9 +52,15 @@ class PtySession:
     launch_activity_kind: str | None = None
     launch_direct_generation: int = 0
     launch_direct_submitted_at: str | None = None
-    resume_confirmation_sent: bool = False
-    resume_confirmation_sent_at: float | None = None
     stream_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    launch_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    dialog_scan_offset: int = 0
+    dialog_confirmations: int = 0
+    started_at: float | None = None
+    input_ready: bool = False
+    input_ready_at: float | None = None
+    input_scan_offset: int = 0
+    startup_complete: bool = False
     buffer: bytearray = field(default_factory=bytearray)
     base_offset: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -98,12 +106,12 @@ class PtySession:
     def write(self, data: bytes) -> int:
         with self.fd_lock:
             if self.master_fd < 0:
-                raise RuntimeError("Copilot terminal is closed")
+                raise RuntimeError("Claude terminal is closed")
             try:
                 return os.write(self.master_fd, data)
             except OSError as exc:
                 if exc.errno == errno.EBADF:
-                    raise RuntimeError("Copilot terminal is closed") from exc
+                    raise RuntimeError("Claude terminal is closed") from exc
                 raise
 
     def close_master_fd(self) -> None:
@@ -251,7 +259,8 @@ class TerminalRuntime:
     DIRECT_PROMPT_ACCEPTANCE_GRACE_SECONDS = 5
     DIRECT_ACTIVITY_STALL_SECONDS = 10 * 60
     DIRECT_WATCHDOG_INTERVAL_SECONDS = 2
-    RESUME_CONFIRMATION_PERSIST_SECONDS = 2
+    STARTUP_DIALOG_MAX_CONFIRMATIONS = 4
+    SETTLE_SECONDS = 0.5
     PTY_READ_POLL_SECONDS = 0.05
     PTY_EXIT_IDLE_GRACE_SECONDS = 0.25
     PTY_EXIT_DRAIN_MAX_SECONDS = 2
@@ -269,20 +278,20 @@ class TerminalRuntime:
         r")+\Z",
         re.DOTALL,
     )
-    _RESUME_CONFLICT_PROMPT = re.compile(
-        r"""
-        Session\s+in\s+use
-        .*?This\s+session\s+was\s+last\s+active\b
-        .*?appears\s+to\s+be\s+in\s+use\s+by\s+another\s+CLI\s+or\s+application\.
-        .*?Resuming\s+it\s+here\s+may\s+cause\s+conflicts\.
-        .*?\u276f\s*1\.\s*Resume\s+anyway
-        .*?2\.\s*Go\s+back\s*\(Esc\)
-        .*?\u2191/\u2193\s+to\s+navigate
-        \s*\u00b7\s*enter\s+to\s+select
-        \s*\u00b7\s*esc\s+to\s+cancel
-        """,
-        re.IGNORECASE | re.DOTALL | re.VERBOSE,
+    # Claude Code startup dialogs, matched against visible text with whitespace removed.
+    _FOLDER_TRUST_MARKERS = (
+        "doyoutrustthefiles",
+        "trustthisfolder",
+        "isthisaprojectyoucreated",
     )
+    _BYPASS_PERMISSIONS_MARKERS = ("bypasspermissionsmode", "yes,iaccept")
+    # Shown over the prompt box after launch by Claude Code 2.1.29x; it swallows input.
+    _AUTO_MODE_PROMPT_MARKERS = ("makeautomodeyourdefaultpermissionmode", "keepmanualmode")
+    # Dialogs that appear after the prompt box is drawn need a moment to show up.
+    STARTUP_DIALOG_GRACE_SECONDS = 1.5
+    # The prompt box footer; Claude drops pasted input sent before it is drawn.
+    _INPUT_READY_MARKERS = ("shift+tabtocycle", "forshortcuts")
+    INPUT_READY_FALLBACK_SECONDS = 10
     _INPUT_REQUIRED = re.compile(
         r"""(?ix)
         \b(?:
@@ -304,11 +313,15 @@ class TerminalRuntime:
         r"(?i)^\s*(?:\*\*)?(?:outcome|completed|done|implemented|fixed|finished|succeeded|verified|result)\b"
     )
     _OPTIONAL_FOLLOW_UP = re.compile(r"(?i)\bwould\s+you\s+like\s+me\s+to\b")
+    INTERRUPT_RECONCILE_INTERVAL_SECONDS = 0.5
+    # Session event logs live under the configured state directory; set per runtime.
+    _sessions_root: ClassVar[Path | None] = None
+    _interrupt_checked_at: ClassVar[dict[str, float]] = {}
 
     def __init__(self, repository: Repository, settings: Settings):
         self.repository = repository
         self.settings = settings
-        self.instructions_dir = str(Path(__file__).parent / "agent_instructions")
+        TerminalRuntime._sessions_root = settings.sessions_dir
         self._sessions: dict[str, PtySession] = {}
         self._clients: dict[str, tuple[str, WebSocket]] = {}
         self._lock = threading.RLock()
@@ -317,8 +330,11 @@ class TerminalRuntime:
         self._direct_interrupts: dict[str, int] = {}
         self._direct_watchdog: threading.Thread | None = None
         self._direct_watchdog_stop = threading.Event()
-        self._resume_confirmations: set[tuple[str, str, int]] = set()
         self._folder_trust_confirmations: set[tuple[str, str, int]] = set()
+        self._bypass_confirmations: set[tuple[str, str, int]] = set()
+        self._auto_mode_prompt_answers: set[tuple[str, str, int]] = set()
+        self._dismissed_dialogs: set[tuple[str, str, int]] = set()
+        self._probing: set[str] = set()
         self._last_process_exits: dict[str, dict[str, Any]] = {}
         self._worker_idle_callback: Callable[[], None] | None = None
         self._worker_recovery_callback: Callable[[str], None] | None = None
@@ -416,12 +432,16 @@ class TerminalRuntime:
             submitted_prompt = message.get("prompt")
             if not isinstance(submitted_prompt, str):
                 submitted_prompt = tracked_prompt
-            outcome["direct_activity"] = self.track_direct_prompt_submission(
-                worker,
-                submitted_prompt if isinstance(submitted_prompt, str) else None,
-                copilot_session_id=attached_session_id,
-                terminal_generation=attached_terminal_generation,
-            )
+            try:
+                outcome["direct_activity"] = self.track_direct_prompt_submission(
+                    worker,
+                    submitted_prompt if isinstance(submitted_prompt, str) else None,
+                    copilot_session_id=attached_session_id,
+                    terminal_generation=attached_terminal_generation,
+                )
+            except Exception:
+                # Activity tracking is bookkeeping; never drop the user's keystroke over it.
+                logger.exception("Could not track a direct prompt submission")
         self.touch_worker(worker["id"])
 
     def set_worker_idle_callback(self, callback: Callable[[], None]) -> None:
@@ -441,13 +461,54 @@ class TerminalRuntime:
         except (IndexError, OSError, ValueError):
             return None
 
+    @staticmethod
+    def _ps_processes() -> list[tuple[int, int, int, str, str]]:
+        """List (pid, pgid, uid, state, command) on systems without /proc, such as macOS."""
+        try:
+            result = subprocess.run(
+                ["ps", "-axww", "-o", "pid=,pgid=,uid=,stat=,command="],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        rows = []
+        for line in result.stdout.splitlines():
+            fields = line.split(None, 4)
+            if len(fields) < 4:
+                continue
+            try:
+                pid, pgid, uid = int(fields[0]), int(fields[1]), int(fields[2])
+            except ValueError:
+                continue
+            rows.append((pid, pgid, uid, fields[3], fields[4] if len(fields) > 4 else ""))
+        return rows
+
+    def _is_managed_claude_command(self, arguments: list[str]) -> bool:
+        # Managed sessions carry the Hub hook command, which names this state directory.
+        state_dir = str(self.settings.state_dir.expanduser())
+        return any(
+            "claude_events.py" in argument and state_dir in argument for argument in arguments
+        )
+
     def _managed_terminal_process_groups(
         self,
         proc_root: Path = Path("/proc"),
     ) -> set[int]:
+        if not proc_root.exists():
+            return {
+                pgid
+                for pid, pgid, uid, _, command in self._ps_processes()
+                if uid == os.getuid()
+                and pid == pgid
+                and pgid != os.getpgrp()
+                and self._is_managed_claude_command([command])
+            }
         try:
             expected_state_dir = self.settings.state_dir.expanduser().resolve()
-            configured_executable = self.settings.copilot_executable
+            configured_executable = self.settings.claude_executable
             resolved_executable = shutil.which(configured_executable) or configured_executable
             executable_paths = {
                 str(Path(configured_executable).expanduser()),
@@ -488,12 +549,7 @@ class TerminalRuntime:
                 continue
             if not executable_paths.intersection(arguments):
                 continue
-            if not {
-                "--yolo",
-                "--no-ask-user",
-                "--mouse=on",
-                "--no-remote-export",
-            }.issubset(arguments):
+            if not self._is_managed_claude_command(arguments):
                 continue
             pid = int(proc_dir.name)
             process_group = self._proc_process_group(proc_dir)
@@ -507,6 +563,11 @@ class TerminalRuntime:
             os.killpg(process_group, 0)
         except ProcessLookupError:
             return False
+        except PermissionError:
+            # macOS reports EPERM for a group whose remaining members are zombies.
+            signalable = False
+        else:
+            signalable = True
         try:
             members = []
             for proc_dir in Path("/proc").iterdir():
@@ -519,12 +580,18 @@ class TerminalRuntime:
                 except (IndexError, OSError, ValueError):
                     continue
         except OSError:
-            return True
+            members = [
+                state
+                for _, pgid, _, state, _ in TerminalRuntime._ps_processes()
+                if pgid == process_group
+            ]
+            if not members:
+                return signalable
         if members:
-            return any(state != "Z" for state in members)
+            return any(not state.startswith("Z") for state in members)
         try:
             os.killpg(process_group, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             return False
         return True
 
@@ -549,7 +616,7 @@ class TerminalRuntime:
         for process_group in process_groups:
             try:
                 os.killpg(process_group, signal.SIGTERM)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
         deadline = time.monotonic() + timeout_seconds
         while (
@@ -562,7 +629,7 @@ class TerminalRuntime:
                 continue
             try:
                 os.killpg(process_group, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
         kill_deadline = time.monotonic() + max(
             0.25,
@@ -654,25 +721,45 @@ class TerminalRuntime:
             raise RuntimeError("Manager worker is not initialized")
         return managers[0]
 
-    def copilot_args(self, worker: dict[str, Any]) -> list[str]:
+    @staticmethod
+    def claude_model(worker: dict[str, Any]) -> str:
+        return claude_events.model_argument(str(worker["model"]), worker.get("context_tier"))
+
+    def claude_permission_args(self) -> tuple[list[str], dict[str, Any]]:
+        return claude_events.permission_arguments(self.settings.permission_mode)
+
+    def claude_args(self, worker: dict[str, Any]) -> list[str]:
+        permission_args, permission_settings = self.claude_permission_args()
+        hub_settings = {
+            **claude_events.hook_settings(self.settings.state_dir),
+            **permission_settings,
+        }
         args = [
-            self.settings.copilot_executable,
+            self.settings.claude_executable,
             "--model",
-            worker["model"],
+            self.claude_model(worker),
             "--effort",
             worker["reasoning_effort"],
-            "--context",
-            worker["context_tier"],
-            "--yolo",
-            "--no-ask-user",
-            "--mouse=on",
-            "--no-remote-export",
+            *permission_args,
             "--add-dir",
             self.settings.agent_default_cwd,
+            "--settings",
+            json.dumps(hub_settings),
+            "--append-system-prompt",
+            session_prompts.session_instructions(worker),
+            # Claude Code otherwise freezes a conversation's system prompt at its first
+            # request, so role instructions changed by the Hub would never take effect.
+            "--system-prompt-snapshot",
+            "off",
         ]
-        session_path = Path("~/.copilot/session-state").expanduser() / worker["copilot_session_id"]
-        if int(worker.get("turn_count", 0)) > 0 or session_path.exists():
-            args.append(f"--resume={worker['copilot_session_id']}")
+        sessions_root = self.settings.sessions_dir
+        session_id = worker["copilot_session_id"]
+        if worker.get("role") == "manager":
+            # The Manager delegates hands-on work; it keeps Bash only for the Hub CLI.
+            args.extend(["--disallowedTools", *MANAGER_DISALLOWED_TOOLS])
+        if claude_events.find_transcript(session_id, sessions_root) is not None:
+            resume_id = claude_events.resume_session_id(session_id, sessions_root)
+            args.append(f"--resume={resume_id}")
         else:
             args.extend(
                 [
@@ -701,7 +788,7 @@ class TerminalRuntime:
     def request_redraw(session: PtySession) -> None:
         try:
             os.killpg(os.getpgid(session.process.pid), signal.SIGWINCH)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
 
     def ensure_terminal(
@@ -736,18 +823,19 @@ class TerminalRuntime:
                 self._check_guard(guard)
                 master_fd, slave_fd = pty.openpty()
                 self._set_size(slave_fd, 36, 120)
-                copilot_args = self.copilot_args(worker)
+                claude_args = self.claude_args(worker)
                 resume_session_id = next(
                     (
                         arg.removeprefix("--resume=")
-                        for arg in copilot_args
+                        for arg in claude_args
                         if arg.startswith("--resume=")
                     ),
                     None,
                 )
+                launch_id = uuid.uuid4().hex
                 env = {
-                    **os.environ,
-                    "COPILOT_CUSTOM_INSTRUCTIONS_DIRS": self.instructions_dir,
+                    **claude_events.child_environment(os.environ),
+                    "COPILOT_HUB_LAUNCH_ID": launch_id,
                     "COPILOT_HUB_ROLE": worker["role"],
                     "COPILOT_HUB_WORKER_ID": worker["id"],
                     "COPILOT_HUB_SESSION_ID": worker["copilot_session_id"],
@@ -762,7 +850,7 @@ class TerminalRuntime:
                 self._check_guard(guard)
                 try:
                     process = subprocess.Popen(
-                        copilot_args,
+                        claude_args,
                         cwd=worker.get("cwd") or self.settings.agent_default_cwd,
                         stdin=slave_fd,
                         stdout=slave_fd,
@@ -788,6 +876,8 @@ class TerminalRuntime:
                     launch_activity_kind=worker.get("activity_kind"),
                     launch_direct_generation=int(worker.get("direct_generation") or 0),
                     launch_direct_submitted_at=worker.get("direct_submitted_at"),
+                    launch_id=launch_id,
+                    started_at=time.monotonic(),
                 )
                 try:
                     self._check_guard(guard)
@@ -807,7 +897,7 @@ class TerminalRuntime:
                 if not recorded:
                     self._sessions.pop(worker["id"], None)
                     self._terminate_session(session)
-                    raise RuntimeError("Worker changed while the Copilot terminal was starting")
+                    raise RuntimeError("Worker changed while the Claude terminal was starting")
                 reader = threading.Thread(
                     target=self._read_loop,
                     args=(session,),
@@ -908,7 +998,7 @@ class TerminalRuntime:
         elif expected_pgid:
             try:
                 os.killpg(expected_pgid, signal.SIGTERM)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
         if pid is not None:
             self.repository.clear_agent_worker_process(worker_id, pid=pid)
@@ -978,7 +1068,7 @@ class TerminalRuntime:
                     "wrapper_return_code": return_code,
                     "process_group_reaped": process_group_reaped,
                 }
-            session.append(f"\r\n[Copilot process exited: {return_code}]\r\n".encode())
+            session.append(f"\r\n[Claude process exited: {return_code}]\r\n".encode())
             self._handle_process_exit(session)
 
     @staticmethod
@@ -1009,7 +1099,7 @@ class TerminalRuntime:
             return
         try:
             os.killpg(process_group, sig)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
 
     @classmethod
@@ -1065,37 +1155,23 @@ class TerminalRuntime:
         generation = self.repository.mark_direct_activity_recovering(
             session.worker_id,
             generation=int(worker.get("direct_generation") or 0),
-            error=f"Copilot terminal exited with status {session.process.poll()}",
+            error=f"Claude terminal exited with status {session.process.poll()}",
         )
         if generation is not None:
             self._notify_worker_recovery(session.worker_id)
 
     @classmethod
-    def _is_resume_conflict_prompt(cls, text: str) -> bool:
+    def _visible_compact_text(cls, data: bytes) -> str:
+        text = data.decode(errors="ignore")
         visible = cls._ANSI_CSI.sub("", cls._ANSI_OSC.sub("", text))
-        visible = re.sub(r"[\u2500-\u257f]", " ", visible)
-        return bool(cls._RESUME_CONFLICT_PROMPT.search(visible))
+        return re.sub(r"[\s\u2500-\u257f]+", "", visible).lower()
 
     @staticmethod
-    def _resume_confirmation_key(session: PtySession) -> tuple[str, str, int]:
+    def _terminal_prompt_key(session: PtySession) -> tuple[str, str, int]:
         return (
             session.worker_id,
             session.copilot_session_id,
             session.terminal_generation,
-        )
-
-    def _resume_confirmation_was_sent(self, session: PtySession) -> bool:
-        with self._lock:
-            return self._resume_confirmation_key(session) in self._resume_confirmations
-
-    def _assert_resume_confirmation_ownership(self, session: PtySession) -> dict[str, Any]:
-        if session.resume_session_id != session.copilot_session_id:
-            raise RuntimeError(
-                "Copilot resume conflict prompt targeted a different session"
-            )
-        return self._assert_terminal_prompt_ownership(
-            session,
-            prompt_name="resume confirmation",
         )
 
     def _assert_terminal_prompt_ownership(
@@ -1150,74 +1226,46 @@ class TerminalRuntime:
             )
         ):
             raise RuntimeError(
-                f"Worker session ownership changed before Copilot {prompt_name}"
+                f"Worker session ownership changed before Claude {prompt_name}"
             )
         return current
 
-    def _confirm_resume_conflict(
-        self,
-        session: PtySession,
-        guard: Callable[[], None] | None,
-    ) -> bool:
-        if session.resume_session_id is None:
-            return False
-        key = self._resume_confirmation_key(session)
-        with self._lock:
-            if key in self._resume_confirmations:
-                session.resume_confirmation_sent = True
-                return False
-            self._check_guard(guard)
-            current = self._assert_resume_confirmation_ownership(session)
-            self._check_guard(guard)
-            written = session.write(b"\r")
-            if written != 1:
-                raise RuntimeError(
-                    "Failed to submit Copilot resume conflict confirmation"
-                )
-            sent_at = time.monotonic()
-            self._resume_confirmations.add(key)
-            session.resume_confirmation_sent = True
-            session.resume_confirmation_sent_at = sent_at
-        logger.info(
-            "Handled Copilot resume conflict confirmation",
-            extra={
-                "event_type": "terminal.resume_conflict_confirmed",
-                "worker_id": session.worker_id,
-                "copilot_session_id": session.copilot_session_id,
-                "terminal_generation": session.terminal_generation,
-                "activity_kind": current.get("activity_kind"),
-                "task_id": current.get("current_task_id"),
-            },
-        )
-        return True
-
     def _folder_trust_confirmation_was_sent(self, session: PtySession) -> bool:
         with self._lock:
-            return self._resume_confirmation_key(session) in self._folder_trust_confirmations
+            return self._terminal_prompt_key(session) in self._folder_trust_confirmations
 
-    def _confirm_folder_trust(
+    def _confirm_startup_dialog(
         self,
         session: PtySession,
         guard: Callable[[], None] | None,
-    ) -> bool:
-        key = self._resume_confirmation_key(session)
+        *,
+        prompt_name: str,
+        confirmations: set[tuple[str, str, int]],
+        keys: tuple[bytes, ...],
+    ) -> None:
         with self._lock:
-            if key in self._folder_trust_confirmations:
-                return False
             self._check_guard(guard)
             current = self._assert_terminal_prompt_ownership(
                 session,
-                prompt_name="folder trust confirmation",
+                prompt_name=prompt_name,
             )
             self._check_guard(guard)
-            written = session.write(b"2\r")
-            if written != 2:
-                raise RuntimeError("Failed to submit Copilot folder trust confirmation")
-            self._folder_trust_confirmations.add(key)
+            for index, data in enumerate(keys):
+                if index:
+                    time.sleep(0.15)
+                if session.write(data) != len(data):
+                    raise RuntimeError(f"Failed to submit Claude {prompt_name}")
+            confirmations.add(self._terminal_prompt_key(session))
+            session.dialog_confirmations += 1
+        # Skip the dialog's own re-render after the keypress; a second answer
+        # would land in the prompt box instead.
+        self._guarded_sleep(1.0, guard)
+        session.dialog_scan_offset = session.end_offset()
         logger.info(
-            "Handled Copilot folder trust confirmation",
+            "Handled Claude %s",
+            prompt_name,
             extra={
-                "event_type": "terminal.folder_trust_confirmed",
+                "event_type": "terminal.startup_dialog_confirmed",
                 "worker_id": session.worker_id,
                 "copilot_session_id": session.copilot_session_id,
                 "terminal_generation": session.terminal_generation,
@@ -1225,7 +1273,116 @@ class TerminalRuntime:
                 "task_id": current.get("current_task_id"),
             },
         )
+
+    @staticmethod
+    def _affirmative_dialog_keys(visible: str) -> tuple[bytes, ...]:
+        """Keys that choose the "Yes" option of a two-option startup dialog.
+
+        Claude Code versions differ in option order and default selection
+        (``❯ 1. Yes, proceed`` versus ``❯ No, exit / Yes, I trust this folder``).
+        """
+        cursor = visible.rfind("\u276f")
+        if cursor >= 0:
+            selected = re.sub(r"^\d+\.", "", visible[cursor + 1 : cursor + 40])
+            return (b"\r",) if selected.startswith("yes") else (b"\x1b[B", b"\r")
+        no_at = visible.rfind("no,exit")
+        yes_at = visible.rfind("yes,")
+        if 0 <= no_at < yes_at:
+            return (b"\x1b[B", b"\r")
+        return (b"\r",)
+
+    @classmethod
+    def _dialog_over_prompt_box(cls, visible: str) -> bool:
+        """Whether a selection list (``❯`` option) is drawn below the prompt box footer.
+
+        Ink draws the prompt box, then its footer, then any dialog, so an option
+        cursor after the last footer belongs to a dialog. Before the prompt box
+        exists Esc could quit Claude, so those dialogs are left alone.
+        """
+        footer = max(visible.rfind(marker) for marker in cls._INPUT_READY_MARKERS)
+        return footer >= 0 and "\u276f" in visible[footer:]
+
+    def _screen_tail(self, session: PtySession, limit: int = 300) -> str:
+        data, _ = session.read_from(max(0, session.end_offset() - 4000))
+        screen = self._ANSI_CSI.sub(" ", self._ANSI_OSC.sub("", data.decode(errors="ignore")))
+        return " ".join(screen.split())[-limit:]
+
+    @staticmethod
+    def _negative_dialog_keys(visible: str) -> tuple[bytes, ...]:
+        """Keys that choose the "No" option of a two-option Yes/No dialog."""
+        cursor = visible.rfind("\u276f")
+        if cursor >= 0:
+            selected = re.sub(r"^\d+\.", "", visible[cursor + 1 : cursor + 40])
+            return (b"\r",) if selected.startswith("no") else (b"\x1b[B", b"\r")
+        return (b"\x1b[B", b"\r")
+
+    def _handle_startup_dialogs(
+        self,
+        session: PtySession,
+        guard: Callable[[], None] | None,
+    ) -> bool:
+        data, _ = session.read_from(session.dialog_scan_offset)
+        visible = self._visible_compact_text(data[-200000:])
+        keys: tuple[bytes, ...] | None = None
+        if any(marker in visible for marker in self._FOLDER_TRUST_MARKERS):
+            prompt_name = "folder trust confirmation"
+            confirmations = self._folder_trust_confirmations
+        elif all(marker in visible for marker in self._BYPASS_PERMISSIONS_MARKERS):
+            prompt_name = "bypass permissions confirmation"
+            confirmations = self._bypass_confirmations
+        elif all(marker in visible for marker in self._AUTO_MODE_PROMPT_MARKERS):
+            # Decline: accepting would change the user's default mode for every session.
+            prompt_name = "auto mode default prompt"
+            confirmations = self._auto_mode_prompt_answers
+            keys = self._negative_dialog_keys(visible)
+        elif self._dialog_over_prompt_box(visible):
+            # A dialog this Hub does not know yet, shown over a live prompt box by a
+            # newer Claude Code. Esc dismisses it and keeps the current behavior.
+            prompt_name = "unrecognized startup dialog"
+            confirmations = self._dismissed_dialogs
+            keys = (b"\x1b",)
+            logger.warning(
+                "Dismissing an unrecognized Claude startup dialog with Esc: %s",
+                self._screen_tail(session),
+                extra={"event_type": "terminal.unrecognized_dialog_dismissed"},
+            )
+        else:
+            return False
+        if keys is None:
+            keys = self._affirmative_dialog_keys(visible)
+        if session.dialog_confirmations >= self.STARTUP_DIALOG_MAX_CONFIRMATIONS:
+            raise RuntimeError(f"Claude {prompt_name} persisted after it was handled")
+        # Let the dialog finish rendering before answering it.
+        self._guarded_sleep(0.3, guard)
+        self._confirm_startup_dialog(
+            session,
+            guard,
+            prompt_name=prompt_name,
+            confirmations=confirmations,
+            keys=keys,
+        )
         return True
+
+    def _prompt_box_drawn(self, session: PtySession) -> bool:
+        """Whether Claude has drawn its prompt box since this terminal launched.
+
+        The SessionStart hook runs before the TUI accepts input, so a prompt
+        pasted right after it is lost.
+        """
+        if session.input_ready:
+            return True
+        data, end = session.read_from(session.input_scan_offset)
+        visible = self._visible_compact_text(data)
+        # Keep an overlap so a marker split across reads is still found.
+        session.input_scan_offset = max(session.input_scan_offset, end - 256)
+        started_at = session.started_at
+        if any(marker in visible for marker in self._INPUT_READY_MARKERS) or (
+            started_at is not None
+            and time.monotonic() - started_at >= self.INPUT_READY_FALLBACK_SECONDS
+        ):
+            session.input_ready = True
+            session.input_ready_at = time.monotonic()
+        return session.input_ready
 
     def _wait_until_ready(
         self,
@@ -1235,105 +1392,133 @@ class TerminalRuntime:
         fresh: bool = False,
         guard: Callable[[], None] | None = None,
     ) -> None:
+        """Wait until the Claude prompt box accepts input.
+
+        Readiness comes from the session's hook events: this launch reported
+        SessionStart and no top-level turn is open. ``fresh`` is accepted for
+        callers written against screen-based readiness and has no effect.
+        """
+        del fresh
         self._check_guard(guard)
-        offset = session.end_offset() if fresh else 0
-        screen = b""
-        if fresh:
-            self.request_redraw(session)
+        sessions_root = self.settings.sessions_dir
+        session_id = session.copilot_session_id
         deadline = time.monotonic() + timeout_seconds
-        resume_prompt_reappeared_at: float | None = None
-        folder_trust_prompt_reappeared_at: float | None = None
+        settled_at: float | None = None
+        launched = False
         while time.monotonic() < deadline:
             self._check_guard(guard)
             if session.process.poll() is not None:
                 raise RuntimeError(
-                    f"Copilot terminal exited before becoming ready: {session.process.poll()}"
+                    f"Claude terminal exited before becoming ready: {session.process.poll()}"
                 )
-            data, offset = session.read_from(offset)
-            if data:
-                screen = (screen + data)[-100000:]
-                clear_at = screen.rfind(b"\x1b[H\x1b[2J")
-                if clear_at >= 0:
-                    screen = screen[clear_at:]
-            text = screen.decode(errors="ignore")
-            normalized_text = text.lower()
-            ready_at = normalized_text.rfind("open sidebar")
-            resume_prompt_visible = (
-                self._is_resume_conflict_prompt(text)
-                and normalized_text.rfind("session in use") > ready_at
-            )
-            confirmation_sent = self._resume_confirmation_was_sent(session)
-            if confirmation_sent:
-                self._check_guard(guard)
-                self._assert_resume_confirmation_ownership(session)
-            if resume_prompt_visible and session.resume_session_id is not None:
-                if not confirmation_sent:
-                    self._confirm_resume_conflict(session, guard)
-                    screen = b""
-                    resume_prompt_reappeared_at = None
+            launched = claude_events.launch_started(session_id, session.launch_id, sessions_root)
+            if not launched:
+                if not self._handle_startup_dialogs(session, guard):
+                    self._guarded_sleep(0.1, guard)
+                continue
+            if not session.startup_complete:
+                if self._handle_startup_dialogs(session, guard):
                     continue
-                if resume_prompt_reappeared_at is None:
-                    resume_prompt_reappeared_at = time.monotonic()
-                elif (
-                    time.monotonic() - resume_prompt_reappeared_at
-                    >= self.RESUME_CONFIRMATION_PERSIST_SECONDS
+                if not self._prompt_box_drawn(session) or (
+                    time.monotonic() - (session.input_ready_at or 0)
+                    < self.STARTUP_DIALOG_GRACE_SECONDS
                 ):
-                    raise RuntimeError(
-                        "Copilot resume conflict confirmation persisted after it was handled"
-                    )
-            else:
-                resume_prompt_reappeared_at = None
-            folder_trust_prompt_visible = (
-                max(
-                    normalized_text.rfind("confirm folder trust"),
-                    normalized_text.rfind("do you trust the files"),
-                )
-                > ready_at
-            )
-            if folder_trust_prompt_visible:
-                if not self._folder_trust_confirmation_was_sent(session):
-                    self._confirm_folder_trust(session, guard)
-                    screen = b""
-                    folder_trust_prompt_reappeared_at = None
+                    self._guarded_sleep(0.1, guard)
                     continue
-                if folder_trust_prompt_reappeared_at is None:
-                    folder_trust_prompt_reappeared_at = time.monotonic()
-                elif (
-                    time.monotonic() - folder_trust_prompt_reappeared_at
-                    >= self.RESUME_CONFIRMATION_PERSIST_SECONDS
-                ):
-                    raise RuntimeError(
-                        "Copilot folder trust confirmation persisted after it was handled"
-                    )
+                if self._handle_startup_dialogs(session, guard):
+                    continue
+                # Stop scanning for dialogs: later output is conversation text.
+                session.startup_complete = True
+            claude_events.reconcile_interrupted_turn(session_id, sessions_root)
+            if claude_events.turn_open(session_id, sessions_root):
+                settled_at = None
                 self._guarded_sleep(0.1, guard)
                 continue
-            folder_trust_prompt_reappeared_at = None
-            paste_at = normalized_text.rfind("[paste #")
-            working_at = normalized_text.rfind("working esc interrupt")
-            pending_paste = paste_at >= 0 and not (
-                working_at > paste_at and ready_at > working_at
-            )
-            blocking_at = max(
-                working_at,
-                normalized_text.rfind("resuming session"),
-                normalized_text.rfind("session in use"),
-            )
-            if ready_at >= 0 and ready_at > blocking_at and not pending_paste:
+            now = time.monotonic()
+            if settled_at is None:
+                settled_at = now
+            # Give the prompt box time to redraw after the SessionStart or Stop hook.
+            if now - settled_at >= self.SETTLE_SECONDS:
                 self._check_guard(guard)
                 return
-            self._guarded_sleep(0.1, guard)
+            self._guarded_sleep(0.05, guard)
         self._check_guard(guard)
-        if self._resume_confirmation_was_sent(session):
+        if not launched:
             raise RuntimeError(
-                "Timed out waiting for Copilot terminal readiness after handling "
-                "the resume conflict confirmation"
+                "Timed out waiting for Claude terminal readiness: the session never "
+                "reported SessionStart (are Claude Code hooks disabled by policy?); "
+                f"terminal ends with: {self._screen_tail(session)}"
             )
-        if self._folder_trust_confirmation_was_sent(session):
-            raise RuntimeError(
-                "Timed out waiting for Copilot terminal readiness after handling "
-                "the folder trust confirmation"
-            )
-        raise RuntimeError("Timed out waiting for Copilot terminal readiness")
+        raise RuntimeError(
+            "Timed out waiting for Claude terminal readiness; terminal ends with: "
+            f"{self._screen_tail(session)}"
+        )
+
+    def is_probing(self, worker_id: str) -> bool:
+        with self._lock:
+            return worker_id in self._probing
+
+    def probe_input(
+        self,
+        worker: dict[str, Any],
+        *,
+        timeout_seconds: float = 90,
+        render_timeout_seconds: float = 5,
+    ) -> dict[str, Any]:
+        """Check that pasted input reaches an idle worker's prompt box, without submitting.
+
+        Pastes a marker, waits for Claude to draw it, then clears the prompt box.
+        Nothing is sent to the model.
+        """
+        with self._lock:
+            if worker["id"] in self._probing:
+                return {"status": "skipped", "detail": "A probe is already running"}
+            self._probing.add(worker["id"])
+        session: PtySession | None = None
+        try:
+            session = self.ensure_terminal(worker, wait_for_ready=False)
+            self._wait_until_ready(session, timeout_seconds=timeout_seconds)
+            with session.prompt_dispatch_lock:
+                current = self.repository.get_agent_worker(worker["id"])
+                if (
+                    not current
+                    or current.get("state") != "idle"
+                    or current.get("current_task_id")
+                    or current.get("direct_submitted_at")
+                    or session.prompt_input_dirty
+                ):
+                    return {"status": "skipped", "detail": "The worker became busy"}
+                marker = f"hub input probe {uuid.uuid4().hex[:8]}"
+                session.write(b"\x15")
+                time.sleep(0.1)
+                offset = session.end_offset()
+                session.write(b"\x1b[200~" + marker.encode() + b"\x1b[201~")
+                rendered = b""
+                deadline = time.monotonic() + render_timeout_seconds
+                drawn = False
+                while time.monotonic() < deadline and not drawn:
+                    data, offset = session.read_from(offset)
+                    rendered = (rendered + data)[-50000:]
+                    drawn = self._prompt_rendered(rendered, marker)
+                    if not drawn:
+                        time.sleep(0.05)
+                session.write(b"\x15")
+                session.prompt_input.reset()
+            if drawn:
+                return {"status": "passed", "detail": "Pasted input reached the prompt box"}
+            return {
+                "status": "failed",
+                "detail": (
+                    "Pasted input never appeared in the prompt box; terminal ends with: "
+                    f"{self._screen_tail(session)}"
+                ),
+            }
+        except RuntimeError as exc:
+            return {"status": "failed", "detail": str(exc)}
+        finally:
+            with self._lock:
+                self._probing.discard(worker["id"])
+            self._notify_worker_idle()
 
     def render_prompt(
         self,
@@ -1370,29 +1555,38 @@ class TerminalRuntime:
             b"\x1b[200~" + prompt.encode() + b"\x1b[201~",
         )
         deadline = time.monotonic() + timeout_seconds
-        visible_lines = [
-            line.encode()
-            for line in prompt.splitlines()
-            if line.strip()
-        ]
-        render_markers = {
-            visible_lines[0],
-            visible_lines[-1],
-        }
         rendered = b""
         while time.monotonic() < deadline:
             self._check_guard(guard)
             data, offset = session.read_from(offset)
             if data:
                 rendered = (rendered + data)[-50000:]
-            if b"[Paste #" in rendered or any(
-                marker in rendered for marker in render_markers
-            ):
+            if self._prompt_rendered(rendered, prompt):
                 break
             self._guarded_sleep(0.05, guard)
         else:
-            raise RuntimeError("Copilot did not render the dispatched prompt")
+            raise RuntimeError(
+                "Claude did not render the dispatched prompt; terminal ends with: "
+                f"{self._screen_tail(session)}"
+            )
         self._check_guard(guard)
+
+    @classmethod
+    def _prompt_rendered(cls, rendered: bytes, prompt: str) -> bool:
+        """Whether the prompt box shows the pasted prompt.
+
+        Claude collapses long pastes into ``[Pasted text #N ...]`` and wraps
+        long lines, so compare whitespace-free visible text.
+        """
+        visible = cls._visible_compact_text(rendered)
+        if "[pastedtext#" in visible:
+            return True
+        lines = [
+            re.sub(r"\s+", "", line).lower() for line in prompt.splitlines() if line.strip()
+        ]
+        if not lines:
+            return False
+        return lines[0][:40] in visible or lines[-1][-40:] in visible
 
     def submit_rendered_prompt(
         self,
@@ -1476,7 +1670,7 @@ class TerminalRuntime:
             with self._lock:
                 if self._sessions.get(worker["id"]) is not session:
                     raise RuntimeError(
-                        "Copilot terminal changed before interruption recovery"
+                        "Claude terminal changed before interruption recovery"
                     )
                 if session.prompt_input_dirty:
                     return False
@@ -1746,7 +1940,7 @@ class TerminalRuntime:
                 with self._lock:
                     self._sessions.setdefault(worker["id"], previous)
                 raise RuntimeError(
-                    "Prior Copilot process group survived terminal recovery cleanup"
+                    "Prior Claude process group survived terminal recovery cleanup"
                 )
         self._check_guard(guard)
         session: PtySession | None = None
@@ -1768,7 +1962,7 @@ class TerminalRuntime:
                 )
             except RuntimeError as exc:
                 if session.process.poll() is not None or not str(exc).startswith(
-                    "Timed out waiting for Copilot terminal readiness"
+                    "Timed out waiting for Claude terminal readiness"
                 ):
                     raise
         except RuntimeError:
@@ -1800,14 +1994,39 @@ class TerminalRuntime:
                 return None
             return dict(value)
 
-    @staticmethod
-    def event_cursor(session_id: str) -> int:
-        path = Path("~/.copilot/session-state").expanduser() / session_id / "events.jsonl"
+    @classmethod
+    def _events_path(cls, session_id: str) -> Path:
+        return claude_events.events_path(
+            session_id,
+            cls._sessions_root or claude_events.sessions_root(),
+        )
+
+    @classmethod
+    def _reconcile_interrupts(cls, session_id: str) -> None:
+        now = time.monotonic()
+        if (
+            now - cls._interrupt_checked_at.get(session_id, 0.0)
+            < cls.INTERRUPT_RECONCILE_INTERVAL_SECONDS
+        ):
+            return
+        cls._interrupt_checked_at[session_id] = now
+        try:
+            claude_events.reconcile_interrupted_turn(
+                session_id,
+                cls._sessions_root or claude_events.sessions_root(),
+            )
+        except OSError:
+            logger.exception("Could not reconcile an interrupted Claude turn")
+
+    @classmethod
+    def event_cursor(cls, session_id: str) -> int:
+        path = cls._events_path(session_id)
         return path.stat().st_size if path.exists() else 0
 
-    @staticmethod
-    def events_after(session_id: str, cursor: int) -> list[dict[str, Any]]:
-        path = Path("~/.copilot/session-state").expanduser() / session_id / "events.jsonl"
+    @classmethod
+    def events_after(cls, session_id: str, cursor: int) -> list[dict[str, Any]]:
+        cls._reconcile_interrupts(session_id)
+        path = cls._events_path(session_id)
         if not path.exists():
             return []
         with path.open("rb") as stream:
@@ -1850,9 +2069,12 @@ class TerminalRuntime:
         return not cls._interaction_lifecycle(events, interaction_id).settled
 
     @staticmethod
-    def direct_prompt_hash(prompt: str) -> str:
-        normalized = prompt.replace("\r\n", "\n").replace("\r", "\n").strip()
-        return hashlib.sha256(normalized.encode()).hexdigest()
+    def _normalized_prompt(prompt: str) -> str:
+        return prompt.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    @classmethod
+    def direct_prompt_hash(cls, prompt: str) -> str:
+        return hashlib.sha256(cls._normalized_prompt(prompt).encode()).hexdigest()
 
     @classmethod
     def matching_direct_prompt(
@@ -1909,7 +2131,7 @@ class TerminalRuntime:
             interaction_id = data.get("interactionId")
             if (
                 isinstance(content, str)
-                and content.strip() == prompt.strip()
+                and cls._normalized_prompt(content) == cls._normalized_prompt(prompt)
                 and isinstance(interaction_id, str)
             ):
                 return interaction_id
@@ -1934,7 +2156,7 @@ class TerminalRuntime:
                 return interaction_id
             cls._guarded_sleep(0.1, guard)
         cls._check_guard(guard)
-        raise RuntimeError("Copilot did not accept the dispatched prompt")
+        raise RuntimeError("Claude did not accept the dispatched prompt")
 
     @staticmethod
     def _interaction_id(data: dict[str, Any]) -> str | None:
@@ -2336,9 +2558,12 @@ class TerminalRuntime:
                 else self.UNKNOWN_DIRECT_PROMPT_HASH
             ),
         )
-        if activity["status"] in {"active", "pending"}:
-            self._start_direct_monitor(current["id"])
-        return activity
+        if activity is None:
+            # A direct turn is already tracked (a follow-up typed while Claude is
+            # working), or the worker owns a task; the input still reaches the PTY.
+            return {"status": "ignored"}
+        self._start_direct_monitor(current["id"])
+        return {"status": "active", "worker_id": current["id"]}
 
     def _start_direct_watchdog(self) -> None:
         with self._lock:
@@ -2818,6 +3043,15 @@ class TerminalRuntime:
                 if not active_interaction_id:
                     time.sleep(0.2)
                     continue
+                if active_interaction_id != worker["direct_interaction_id"]:
+                    if not self.repository.advance_direct_interaction(
+                        worker_id,
+                        generation=generation,
+                        from_interaction_id=str(worker["direct_interaction_id"]),
+                        to_interaction_id=active_interaction_id,
+                    ):
+                        time.sleep(0.2)
+                    continue
                 lifecycle = self._interaction_lifecycle(
                     events,
                     active_interaction_id,
@@ -3083,7 +3317,7 @@ class TerminalRuntime:
     @staticmethod
     def _ask_user_reason(arguments: object) -> str:
         if not isinstance(arguments, dict):
-            return "Copilot is waiting for your response."
+            return "Claude is waiting for your response."
         question = sanitize_context_text(arguments.get("question"), limit=400)
         choices = arguments.get("choices")
         labels: list[str] = []
@@ -3108,7 +3342,7 @@ class TerminalRuntime:
                 f"{question} Options: {', '.join(labels)}",
                 limit=500,
             )
-        return question or "Copilot is waiting for your response."
+        return question or "Claude is waiting for your response."
 
     @classmethod
     def latest_user_interaction_after_cursor(
@@ -3592,9 +3826,9 @@ class TerminalRuntime:
             return int(value)
         return None
 
-    @staticmethod
-    def latest_turn_index(session_id: str) -> int:
-        events_path = Path("~/.copilot/session-state").expanduser() / session_id / "events.jsonl"
+    @classmethod
+    def latest_turn_index(cls, session_id: str) -> int:
+        events_path = cls._events_path(session_id)
         latest = -1
         if events_path.exists():
             for line in events_path.read_text(errors="ignore").splitlines():
@@ -3604,69 +3838,38 @@ class TerminalRuntime:
                     continue
                 if event.get("type") not in {"user.message", "assistant.message"}:
                     continue
-                turn_id = TerminalRuntime._event_turn_index((event.get("data") or {}).get("turnId"))
+                turn_id = cls._event_turn_index((event.get("data") or {}).get("turnId"))
                 if turn_id is not None:
                     latest = max(latest, turn_id)
-            if latest >= 0:
-                return latest
-        path = Path("~/.copilot/session-store.db").expanduser()
-        if not path.exists():
-            return -1
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        try:
-            row = connection.execute(
-                "SELECT MAX(turn_index) FROM turns WHERE session_id=?",
-                (session_id,),
-            ).fetchone()
-            return int(row[0]) if row and row[0] is not None else -1
-        finally:
-            connection.close()
+        return latest
 
-    @staticmethod
-    def response_after(session_id: str, turn_index: int) -> str | None:
-        events_path = Path("~/.copilot/session-state").expanduser() / session_id / "events.jsonl"
-        if events_path.exists():
-            for line in events_path.read_text(errors="ignore").splitlines():
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") != "assistant.message":
-                    continue
-                data = event.get("data") or {}
-                event_turn = TerminalRuntime._event_turn_index(data.get("turnId"))
-                content = data.get("content")
-                if (
-                    event_turn is not None
-                    and event_turn > turn_index
-                    and isinstance(content, str)
-                    and content
-                ):
-                    return content
-        path = Path("~/.copilot/session-store.db").expanduser()
-        if not path.exists():
+    @classmethod
+    def response_after(cls, session_id: str, turn_index: int) -> str | None:
+        events_path = cls._events_path(session_id)
+        if not events_path.exists():
             return None
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        try:
-            row = connection.execute(
-                """
-                SELECT assistant_response
-                FROM turns
-                WHERE session_id=? AND turn_index>?
-                  AND assistant_response IS NOT NULL
-                  AND length(assistant_response)>0
-                ORDER BY turn_index
-                LIMIT 1
-                """,
-                (session_id, turn_index),
-            ).fetchone()
-            return str(row[0]) if row else None
-        finally:
-            connection.close()
+        for line in events_path.read_text(errors="ignore").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "assistant.message":
+                continue
+            data = event.get("data") or {}
+            event_turn = cls._event_turn_index(data.get("turnId"))
+            content = data.get("content")
+            if (
+                event_turn is not None
+                and event_turn > turn_index
+                and isinstance(content, str)
+                and content
+            ):
+                return content
+        return None
 
-    @staticmethod
-    def history(session_id: str) -> list[dict[str, str]]:
-        events_path = Path("~/.copilot/session-state").expanduser() / session_id / "events.jsonl"
+    @classmethod
+    def history(cls, session_id: str) -> list[dict[str, str]]:
+        events_path = cls._events_path(session_id)
         if not events_path.exists():
             return []
         entries: list[dict[str, str]] = []

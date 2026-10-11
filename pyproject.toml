@@ -1,7 +1,7 @@
 [project]
 name = "copilot-hub"
 version = "0.1.0"
-description = "Personal web workspace for persistent Copilot CLI sessions"
+description = "Personal web workspace for persistent Claude Code sessions"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

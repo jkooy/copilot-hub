@@ -28,8 +28,12 @@ Use this skill for the local personal Copilot Hub.
 Use `restart.sh` from a Manager or Worker terminal. Never synchronously stop the
 server that owns the current PTY.
 
-Managed sessions use `--yolo --no-ask-user`; explain that they can run tools
-without interactive confirmation before enabling the Hub for a new user.
+Managed sessions are Claude Code processes. By default they use
+`--dangerously-skip-permissions` (`COPILOT_HUB_PERMISSION_MODE=bypassPermissions`);
+explain that they can run tools without interactive confirmation before
+enabling the Hub for a new user. Session event logs written by the Hub's Claude
+Code hooks live under `${COPILOT_HUB_STATE_DIR:-$HOME/.copilot-hub}/sessions`, and
+hook failures are logged to `logs/claude-hooks.log` in the same state directory.
 
 ## Verification
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from copilot_hub.db import Repository, utc_now
-from copilot_hub.usage import CopilotUsageMonitor
+from copilot_hub.usage import SessionUsageMonitor
 
 
 def write_events(path, events):
@@ -49,7 +49,7 @@ def test_usage_monitor_reports_completed_and_live_usage(tmp_path):
             },
         ],
     )
-    monitor = CopilotUsageMonitor(sessions)
+    monitor = SessionUsageMonitor(sessions)
 
     usage = monitor.session_usage("session-1")
 

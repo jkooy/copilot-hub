@@ -43,13 +43,15 @@ class SessionUsage:
         }
 
 
-class CopilotUsageMonitor:
+class SessionUsageMonitor:
+    """Token usage from the Hub session logs written by the Claude Code hooks."""
+
     BOOTSTRAP_BYTES = 16 * 1024 * 1024
     MAX_EVENT_BYTES = 1024 * 1024
     INCREMENTAL_BYTES = 8 * 1024 * 1024
 
     def __init__(self, sessions_root: Path | None = None):
-        self.sessions_root = sessions_root or Path("~/.copilot/session-state").expanduser()
+        self.sessions_root = sessions_root or Path("~/.copilot-hub/sessions").expanduser()
         self._lock = threading.Lock()
         self._sessions: dict[str, SessionUsage] = {}
 
@@ -75,10 +77,19 @@ class CopilotUsageMonitor:
                 totals[key] += int(usage.get(source) or 0)
         return totals
 
+    def _apply_model_usage(self, usage: SessionUsage, data: dict[str, Any]) -> None:
+        if not data.get("modelMetrics"):
+            return
+        for key, value in self._model_usage(data).items():
+            setattr(usage, key, max(getattr(usage, key), value))
+        usage.recorded_tokens_available = True
+
     def _apply_event(self, usage: SessionUsage, event: dict[str, Any]) -> None:
         data = event.get("data") or {}
         event_type = event.get("type")
         if event_type == "session.usage_checkpoint":
+            # Claude checkpoints carry cumulative per-model token totals.
+            self._apply_model_usage(usage, data)
             usage.current_nano_aiu = max(
                 usage.current_nano_aiu,
                 int(data.get("totalNanoAiu") or 0),

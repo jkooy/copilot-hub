@@ -57,7 +57,7 @@ stop_owned_process() {
 }
 
 mkdir -p "$STATE_DIR"
-for command in uv copilot curl; do
+for command in uv "${COPILOT_HUB_CLAUDE:-claude}" curl; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Missing required command: $command" >&2
     exit 1

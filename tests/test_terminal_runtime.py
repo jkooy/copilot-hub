@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 from copilot_hub.config import Settings
@@ -36,7 +38,8 @@ def settings(tmp_path):
         log_dir=tmp_path / "state" / "logs",
         host="127.0.0.1",
         port=9988,
-        copilot_executable="copilot",
+        claude_executable="claude",
+        permission_mode="bypassPermissions",
         agent_default_cwd=str(tmp_path),
         agent_model="model",
         agent_reasoning_effort="high",
@@ -103,7 +106,8 @@ def test_pty_replay_resumes_by_stream_and_offset():
             pass
 
 
-def test_terminal_launch_args_are_persistent_and_explicitly_trusted(tmp_path):
+def test_terminal_launch_args_are_persistent_and_explicitly_trusted(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
     configured = settings(tmp_path)
     repository = Repository(configured.db_path)
     repository.initialize()
@@ -112,24 +116,51 @@ def test_terminal_launch_args_are_persistent_and_explicitly_trusted(tmp_path):
         copilot_session_id="session-id",
         name="worker-1",
         role="worker",
-        model="model",
+        model="opus",
         reasoning_effort="high",
-        context_tier="long",
+        context_tier="long_context",
         cwd=str(tmp_path),
     )
 
-    arguments = runtime.copilot_args(worker)
+    arguments = runtime.claude_args(worker)
 
-    assert arguments[0] == "copilot"
-    assert "--yolo" in arguments
-    assert "--no-ask-user" in arguments
-    assert "--mouse=on" in arguments
+    assert arguments[0] == "claude"
+    assert arguments[arguments.index("--model") + 1] == "opus[1m]"
+    assert arguments[arguments.index("--effort") + 1] == "high"
+    assert "--dangerously-skip-permissions" in arguments
+    assert arguments[arguments.index("--system-prompt-snapshot") + 1] == "off"
+    role_prompt = arguments[arguments.index("--append-system-prompt") + 1]
+    assert "Your role: coder worker" not in role_prompt
+    assert "Your role: worker" in role_prompt
+    hub_settings = json.loads(arguments[arguments.index("--settings") + 1])
+    assert hub_settings["skipDangerousModePermissionPrompt"] is True
+    hook = hub_settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+    assert "claude_events.py" in hook
+    assert str(configured.state_dir) in hook
+    assert runtime._is_managed_claude_command(arguments)
     assert arguments[-4:] == [
         "--session-id",
         "session-id",
         "--name",
         "worker-1",
     ]
+
+    transcript = tmp_path / "claude" / "projects" / "-tmp-work" / "session-id.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n", encoding="utf-8")
+    assert runtime.claude_args(worker)[-1] == "--resume=session-id"
+
+
+def test_non_bypass_permission_mode_uses_permission_flag(tmp_path):
+    configured = replace(settings(tmp_path), permission_mode="acceptEdits")
+    repository = Repository(configured.db_path)
+    repository.initialize()
+    runtime = TerminalRuntime(repository, configured)
+
+    arguments, extra = runtime.claude_permission_args()
+
+    assert arguments == ["--permission-mode", "acceptEdits"]
+    assert extra == {}
 
 
 def test_browser_input_is_not_reapplied_after_runtime_restart(tmp_path):
@@ -191,3 +222,61 @@ def test_terminal_source_uses_only_generic_ownership_environment():
         "COPILOT_HUB_STATE_DIR",
     ):
         assert name in source
+
+
+def test_direct_prompt_tracking_starts_monitor_and_tolerates_busy_worker(tmp_path, monkeypatch):
+    configured = settings(tmp_path)
+    repository = Repository(configured.db_path)
+    repository.initialize()
+    runtime = TerminalRuntime(repository, configured)
+    monitors = []
+    monkeypatch.setattr(runtime, "_start_direct_monitor", monitors.append)
+    worker = repository.create_agent_worker(
+        copilot_session_id="session-id",
+        name="copilot-hub-manager",
+        role="manager",
+        model="opus",
+        reasoning_effort="high",
+        context_tier="standard",
+        cwd=str(tmp_path),
+    )
+
+    first = runtime.track_direct_prompt_submission(worker, "first prompt")
+    follow_up = runtime.track_direct_prompt_submission(worker, "typed while busy")
+
+    assert first == {"status": "active", "worker_id": worker["id"]}
+    assert follow_up == {"status": "ignored"}
+    assert monitors == [worker["id"]]
+
+
+def test_manager_launch_disallows_editing_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    configured = settings(tmp_path)
+    repository = Repository(configured.db_path)
+    repository.initialize()
+    runtime = TerminalRuntime(repository, configured)
+    manager = repository.create_agent_worker(
+        copilot_session_id="manager-session",
+        name="copilot-hub-manager",
+        role="manager",
+        model="opus",
+        reasoning_effort="high",
+        context_tier="standard",
+        cwd=str(tmp_path),
+    )
+    worker = repository.create_agent_worker(
+        copilot_session_id="worker-session",
+        name="coder-1",
+        role="worker",
+        model="opus",
+        reasoning_effort="high",
+        context_tier="standard",
+        cwd=str(tmp_path),
+        capabilities=["code"],
+    )
+
+    manager_args = runtime.claude_args(manager)
+    start = manager_args.index("--disallowedTools") + 1
+    assert manager_args[start : start + 3] == ["Edit", "Write", "NotebookEdit"]
+    assert "Your role: Manager" in manager_args[manager_args.index("--append-system-prompt") + 1]
+    assert "--disallowedTools" not in runtime.claude_args(worker)

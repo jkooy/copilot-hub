@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import subprocess
 import threading
 import time
 from collections import defaultdict, deque
@@ -71,6 +73,66 @@ def _process_memory(proc_root: Path) -> tuple[dict[int, int], dict[int, list[int
     return rss_by_pid, children
 
 
+def _command_output(arguments: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            arguments,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _swap_megabytes(text: str, field: str) -> int:
+    match = re.search(rf"{field}\s*=\s*([\d.]+)([KMG])", text)
+    if not match:
+        return 0
+    scale = {"K": 1024, "M": 1024**2, "G": 1024**3}[match.group(2)]
+    return int(float(match.group(1)) * scale)
+
+
+def _darwin_system_memory() -> dict[str, int]:
+    """System memory in the /proc/meminfo shape, read via sysctl and vm_stat on macOS."""
+    total = int(_command_output(["sysctl", "-n", "hw.memsize"]).strip() or 0)
+    vm_stat = _command_output(["vm_stat"])
+    page_size_match = re.search(r"page size of (\d+) bytes", vm_stat)
+    page_size = int(page_size_match.group(1)) if page_size_match else 4096
+    pages = {
+        key.strip(): int(value.strip().rstrip("."))
+        for key, value in re.findall(r"^([^:\n]+):\s+(\d+)\.?$", vm_stat, re.MULTILINE)
+    }
+    available_pages = sum(
+        pages.get(name, 0) for name in ("Pages free", "Pages inactive", "Pages speculative")
+    )
+    swap = _command_output(["sysctl", "-n", "vm.swapusage"])
+    return {
+        "MemTotal": total,
+        "MemAvailable": min(total, available_pages * page_size),
+        "SwapTotal": _swap_megabytes(swap, "total"),
+        "SwapFree": _swap_megabytes(swap, "free"),
+    }
+
+
+def _ps_process_memory() -> tuple[dict[int, int], dict[int, list[int]]]:
+    rss_by_pid: dict[int, int] = {}
+    children: dict[int, list[int]] = defaultdict(list)
+    for line in _command_output(["ps", "-axo", "pid=,ppid=,rss="]).splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            pid, parent_pid, rss_kib = (int(field) for field in fields)
+        except ValueError:
+            continue
+        rss_by_pid[pid] = rss_kib * 1024
+        children[parent_pid].append(pid)
+    return rss_by_pid, children
+
+
 def _descendants(root_pid: int, children: dict[int, list[int]]) -> set[int]:
     found: set[int] = set()
     queue = deque([root_pid])
@@ -88,12 +150,16 @@ def collect_memory_snapshot(
     *,
     proc_root: Path = Path("/proc"),
 ) -> dict[str, Any]:
-    memory = _read_kib_values(proc_root / "meminfo")
+    if (proc_root / "meminfo").exists():
+        memory = _read_kib_values(proc_root / "meminfo")
+        rss_by_pid, children = _process_memory(proc_root)
+    else:
+        memory = _darwin_system_memory()
+        rss_by_pid, children = _ps_process_memory()
     total_bytes = memory["MemTotal"]
     available_bytes = memory["MemAvailable"]
     swap_total_bytes = memory.get("SwapTotal", 0)
     swap_free_bytes = memory.get("SwapFree", 0)
-    rss_by_pid, children = _process_memory(proc_root)
 
     worker_rss: dict[str, int | None] = {}
     role_pids: dict[str, set[int]] = defaultdict(set)

@@ -59,14 +59,27 @@ def test_workspace_health_and_generic_state(app_module):
         "results" if False else "result_summary",
         "memory",
         "reporting",
+        "spend",
+        "self_check",
     }
+    spend = payload["spend"]
+    assert spend["budget_usd"] == 300
+    assert spend["source"] == "transcripts"
+    assert spend["remaining_usd"] == 300
+    assert payload["manager"]["spend_today"]["cost_usd"] == 0
+    assert "Today's budget" in workspace.text
 
 
 def test_task_result_and_worker_apis(app_module):
     with TestClient(app_module.app) as client:
         worker = client.post("/api/agents/workers")
         assert worker.status_code == 200
-        assert worker.json()["name"] == "worker-1"
+        assert worker.json()["name"] == "coder-1"
+        assert worker.json()["worker_type_label"] == "coder"
+        reviewer = client.post("/api/agents/workers", json={"worker_type": "review"})
+        assert reviewer.json()["name"] == "reviewer-1"
+        unknown = client.post("/api/agents/workers", json={"worker_type": "astronaut"})
+        assert unknown.status_code == 400
 
         configured = client.post(
             "/api/agents/config",
@@ -138,3 +151,23 @@ def test_terminal_history_and_redirect(app_module):
     assert history.json()["worker_id"] == manager_id
     assert redirect.status_code == 308
     assert redirect.headers["location"] == "/"
+
+
+def test_inbox_handler_submits_tasks_with_canonical_worker_types(app_module):
+    app_module.repository.initialize()
+    result = app_module.handle_inbox_dispatch(
+        {"title": "Check", "prompt": "Look around", "task_type": "read",
+         "requires_approval": True}
+    )
+    assert result["status"] == "accepted"
+    assert result["worker_type"] == "researcher"
+    task = app_module.repository.get_agent_task(result["task_id"])
+    assert task["task_type"] == "research"
+    assert task["status"] == "awaiting_approval"
+    assert app_module.handle_inbox_dispatch({"title": ""})["status"] == "error"
+
+
+def test_self_check_api_requires_managed_terminals(app_module):
+    with TestClient(app_module.app) as client:
+        response = client.post("/api/control/self-check")
+    assert response.status_code == 409

@@ -110,7 +110,18 @@ def test_task_dispatch_generation_result_trigger_and_idempotent_handoff(tmp_path
         deadline_at="2999-01-01T00:00:00+00:00",
     )
     assert dispatched["dispatch_generation"] == 1
-    assert repository.claim_agent_task_dispatch_attempt(
+    claimed = repository.claim_agent_task_dispatch_attempt(
+        task["id"],
+        worker["id"],
+        generation=1,
+        attempt_id="attempt-0",
+        session_id=worker["copilot_session_id"],
+        event_cursor=7,
+        terminal_generation=0,
+        attempt_limit=4,
+    )
+    assert claimed["dispatch_attempt"] == 1
+    retry = repository.claim_agent_task_dispatch_attempt(
         task["id"],
         worker["id"],
         generation=1,
@@ -120,6 +131,18 @@ def test_task_dispatch_generation_result_trigger_and_idempotent_handoff(tmp_path
         terminal_generation=0,
         attempt_limit=4,
     )
+    assert retry["dispatch_attempt"] == 2
+    assert retry["dispatch_attempt_id"] == "attempt-1"
+    assert repository.claim_agent_task_dispatch_attempt(
+        task["id"],
+        worker["id"],
+        generation=1,
+        attempt_id="attempt-x",
+        session_id=worker["copilot_session_id"],
+        event_cursor=7,
+        terminal_generation=0,
+        attempt_limit=2,
+    ) is None
     assert repository.accept_agent_task_dispatch(
         task["id"],
         worker["id"],

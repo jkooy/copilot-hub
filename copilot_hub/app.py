@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from . import claude_events, dispatch_inbox, self_check
 from .agent_runtime import (
     CopilotAgentRuntime,
     ManagerResultDispatchBlockedError,
@@ -22,6 +24,7 @@ from .config import (
     Settings,
     total_copilot_sessions,
 )
+from .costs import SpendMonitor, load_ledger
 from .db import Repository, utc_now
 from .memory import MemoryMonitor
 from .presentation import (
@@ -37,7 +40,13 @@ from .restart import (
     spawn_restart_helper,
 )
 from .terminal_runtime import TerminalRuntime
-from .usage import CopilotUsageMonitor
+from .usage import SessionUsageMonitor
+from .worker_types import (
+    DEFAULT_WORKER_TYPE,
+    WORKER_TYPES,
+    worker_type_for_task,
+    worker_type_of,
+)
 
 RESULT_TERMINAL_STATUSES = frozenset(
     {"succeeded", "failed", "cancelled", "interrupted"}
@@ -51,12 +60,30 @@ repository = Repository(settings.db_path)
 agent_runtime = CopilotAgentRuntime(repository, settings)
 terminal_runtime = TerminalRuntime(repository, settings)
 memory_monitor = MemoryMonitor()
-usage_monitor = CopilotUsageMonitor()
+usage_monitor = SessionUsageMonitor(settings.sessions_dir)
+spend_monitor = SpendMonitor(
+    daily_budget_usd=settings.daily_budget_usd,
+    timezone=settings.budget_timezone,
+    ledger=load_ledger(settings.spend_ledger),
+)
 agent_runtime.set_terminal_runtime(terminal_runtime)
 server_runtime_state: dict[str, Any] | None = None
 package_dir = Path(__file__).parent
 templates = Jinja2Templates(directory=package_dir / "templates")
 templates.env.auto_reload = False
+
+
+def static_version() -> str:
+    """Content hash of the static assets, appended to their URLs to defeat stale caches."""
+    digest = hashlib.sha256()
+    for path in sorted((package_dir / "static").rglob("*")):
+        if path.is_file():
+            digest.update(path.relative_to(package_dir).as_posix().encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+templates.env.globals["static_version"] = static_version()
 templates.env.globals["worker_display_name"] = worker_display_name
 templates.env.globals["worker_status_presentation"] = worker_status_presentation
 templates.env.globals["worker_status_presentations"] = WORKER_STATUS_PRESENTATIONS
@@ -83,6 +110,9 @@ def agent_worker_state(
         worker.get("name"),
         role=worker.get("role"),
     )
+    specialty = worker_type_of(worker)
+    value["worker_type"] = specialty.key if specialty else None
+    value["worker_type_label"] = specialty.label if specialty else None
     current_title = None
     if worker.get("current_task_id"):
         current_title = concise_current_work_title(
@@ -111,7 +141,7 @@ def agent_worker_state(
         )
         value["recovery_detail"] = (
             worker.get("recovery_error")
-            or "Waiting for Copilot to become ready for input"
+            or "Waiting for Claude to become ready for input"
         )
     else:
         value["activity_label"] = current_title
@@ -190,10 +220,33 @@ def reporting_state(workers: list[dict[str, Any]]) -> dict[str, Any]:
                 "rss_bytes": (
                     active_worker.get("rss_bytes") if active_worker else None
                 ),
+                "spend_today": (
+                    active_worker.get("spend_today") if active_worker else None
+                ),
                 "usage": usage,
             }
         )
     return {"handoffs": handoffs, "usage": usage_reports}
+
+
+def spend_state(workers: list[dict[str, Any]]) -> dict[str, Any]:
+    """Today's spend; also sets ``spend_today`` on each worker in ``workers``."""
+    sessions: dict[str, set[str]] = {}
+    transcripts: dict[str, list[Path]] = {}
+    use_transcripts = not spend_monitor.ledger.available()
+    for worker in repository.list_agent_workers(include_retired=True):
+        session_id = worker["copilot_session_id"]
+        sessions[worker["id"]] = {
+            session_id,
+            claude_events.resume_session_id(session_id, settings.sessions_dir),
+        }
+        if use_transcripts:
+            transcript = claude_events.find_transcript(session_id, settings.sessions_dir)
+            transcripts[worker["id"]] = [transcript] if transcript else []
+    snapshot = spend_monitor.snapshot(sessions, transcripts)
+    for worker in workers:
+        worker["spend_today"] = snapshot["workers"].get(worker["id"])
+    return {key: value for key, value in snapshot.items() if key != "workers"}
 
 
 def initialize_result_inbox() -> str:
@@ -202,6 +255,46 @@ def initialize_result_inbox() -> str:
         started_at = utc_now()
         repository.set_state("agent_results_started_at", started_at)
     return started_at
+
+
+def handle_inbox_dispatch(payload: dict[str, Any]) -> dict[str, Any]:
+    """Submit a task that a managed session queued through the file inbox."""
+    title = str(payload.get("title") or "").strip()
+    prompt = str(payload.get("prompt") or "").strip()
+    if not title or not prompt:
+        return {"status": "error", "error": "title and prompt are required"}
+    specialty = worker_type_for_task(str(payload.get("task_type") or DEFAULT_WORKER_TYPE))
+    try:
+        task = agent_runtime.submit_worker_task(
+            title=title,
+            prompt=prompt,
+            requires_approval=bool(payload.get("requires_approval")),
+            task_type=specialty.key,
+        )
+    except ManagerResultDispatchBlockedError as exc:
+        return {"status": "error", "error": str(exc)}
+    task = repository.get_agent_task(task["id"]) or task
+    worker = (
+        repository.get_agent_worker(task["assigned_worker_id"])
+        if task.get("assigned_worker_id")
+        else None
+    )
+    return {
+        "status": "accepted",
+        "task_id": task["id"],
+        "title": task["title"],
+        "task_type": specialty.key,
+        "worker_type": specialty.label,
+        "task_status": task["status"],
+        "worker": worker["name"] if worker else None,
+        "message": (
+            "Dispatched. The worker's result will be delivered to the Manager terminal "
+            "automatically when it finishes."
+        ),
+    }
+
+
+inbox_poller = dispatch_inbox.InboxPoller(settings.state_dir, handle_inbox_dispatch)
 
 
 @asynccontextmanager
@@ -220,8 +313,12 @@ async def lifespan(_: FastAPI):
     try:
         terminal_runtime.recover()
         agent_runtime.recover()
+        inbox_poller.start()
+        if settings.terminals_enabled:
+            self_check.start(repository, terminal_runtime, settings)
         yield
     finally:
+        inbox_poller.stop()
         agent_runtime.shutdown()
         terminal_runtime.shutdown()
         deactivate_server_runtime(repository, settings, runtime)
@@ -285,6 +382,7 @@ def workspace(request: Request, worker: str | None = None):
     memory = memory_monitor.snapshot(workers)
     for item in workers:
         item["rss_bytes"] = memory["worker_rss_bytes"].get(item["id"])
+    spend = spend_state(workers)
     reporting = reporting_state(workers)
     return templates.TemplateResponse(
         request=request,
@@ -304,6 +402,8 @@ def workspace(request: Request, worker: str | None = None):
             },
             "max_workers": agent_runtime.max_workers,
             "max_sessions": total_copilot_sessions(agent_runtime.max_workers),
+            "spend": spend,
+            "worker_types": list(WORKER_TYPES.values()),
         },
     )
 
@@ -375,6 +475,16 @@ async def manager_terminal_prompt_api(request: Request):
     except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from exc
     return {"status": "submitted", "worker_id": manager["id"]}
+
+
+@app.post("/api/control/self-check")
+def run_self_check_api():
+    if not settings.terminals_enabled:
+        raise HTTPException(409, "Managed terminals are disabled")
+    if self_check.load(repository).get("status") == "running":
+        return self_check.load(repository)
+    self_check.start(repository, terminal_runtime, settings, force=True)
+    return {"status": "running"}
 
 
 @app.post("/api/agents/tasks")
@@ -480,9 +590,18 @@ async def agent_config_api(request: Request):
 
 
 @app.post("/api/agents/workers")
-def create_agent_worker_api():
+async def create_agent_worker_api(request: Request):
+    payload: dict[str, Any] = {}
+    if await request.body():
+        try:
+            payload = await request.json()
+        except ValueError as exc:
+            raise HTTPException(400, "Invalid JSON") from exc
+    worker_type = str(payload.get("worker_type") or DEFAULT_WORKER_TYPE)
+    if worker_type not in WORKER_TYPES:
+        raise HTTPException(400, f"Unknown worker type; choose one of: {', '.join(WORKER_TYPES)}")
     try:
-        return agent_worker_state(agent_runtime.add_worker())
+        return agent_worker_state(agent_runtime.add_worker(worker_type))
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -512,8 +631,11 @@ def agent_state_api(compact: bool = False):
     memory = memory_monitor.snapshot(workers)
     for worker in workers:
         worker["rss_bytes"] = memory["worker_rss_bytes"].get(worker["id"])
+    spend = spend_state(workers)
     return {
         "manager": manager,
+        "spend": spend,
+        "self_check": self_check.load(repository),
         "workers": workers,
         "tasks": [agent_task_state(task) for task in tasks],
         "active_work": active_work_items(tasks, workers),

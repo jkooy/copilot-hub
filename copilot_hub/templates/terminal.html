@@ -5,6 +5,26 @@
 {% block content %}
 <div class="workspace" id="workspace">
   <aside class="rail sessions-rail" aria-label="Sessions and active work">
+    <section class="rail-section budget-section" aria-labelledby="budget-heading">
+      <div class="section-heading">
+        <h2 id="budget-heading">Today's budget</h2>
+        <span id="budget-status" class="status {{ spend.status }}">{{ spend.status }}</span>
+      </div>
+      <p class="budget-figure"><span id="budget-remaining">${{ "%.2f"|format(spend.remaining_usd) }}</span> <small>left</small></p>
+      <div id="budget-meter" class="budget-meter {{ spend.status }}" role="meter"
+           aria-label="Spent today" aria-valuemin="0" aria-valuemax="{{ spend.budget_usd }}"
+           aria-valuenow="{{ spend.spent_usd }}"
+           title="${{ spend.spent_usd }} of ${{ spend.budget_usd }}">
+        <span id="budget-fill" style="width: {{ [spend.used_percent or 0, 100]|min }}%"></span>
+      </div>
+      <dl id="budget-report" class="report-grid">
+        <dt>Spent</dt><dd>${{ "%.2f"|format(spend.spent_usd) }} of ${{ "%.0f"|format(spend.budget_usd) }}</dd>
+        <dt>Hub sessions</dt><dd>${{ "%.2f"|format(spend.hub.cost_usd) }}</dd>
+        <dt>Tokens</dt><dd>{{ "{:,}".format(spend.total.tokens) }}</dd>
+      </dl>
+      <small id="budget-source">{{ spend.source_label }}</small>
+    </section>
+
     <section class="rail-section">
       <div class="section-heading">
         <div>
@@ -12,6 +32,11 @@
           <small id="session-count">{{ workers|length }}/{{ max_sessions }}</small>
         </div>
         <div class="heading-actions">
+          <select id="add-worker-type" class="icon-button" aria-label="New worker type">
+            {% for worker_type in worker_types %}
+            <option value="{{ worker_type.key }}" title="{{ worker_type.summary }}">{{ worker_type.label }}</option>
+            {% endfor %}
+          </select>
           <button id="add-worker" class="icon-button" type="button">+ Worker</button>
           <button id="session-settings-toggle" class="icon-button" type="button" aria-expanded="false" aria-controls="session-settings">Settings</button>
         </div>
@@ -26,7 +51,7 @@
           <button id="save-worker-limit" class="primary" type="button">Save</button>
         </div>
       </div>
-      <nav id="session-list" class="session-list" aria-label="Copilot sessions">
+      <nav id="session-list" class="session-list" aria-label="Claude sessions">
         {% for worker in workers %}
         <a
           href="/?worker={{ worker.id }}"
@@ -67,7 +92,15 @@
     </section>
   </aside>
 
-  <section class="terminal-pane" aria-label="Selected Copilot terminal">
+  <div class="pane-splitter" data-pane="left" role="separator" tabindex="0"
+       aria-orientation="vertical" aria-label="Resize sessions panel"
+       title="Drag to resize · double-click to reset"></div>
+
+  <section class="terminal-pane" aria-label="Selected Claude terminal">
+    <div id="self-check-banner" class="self-check-banner" role="alert" hidden>
+      <p id="self-check-message"></p>
+      <button id="self-check-rerun" type="button">Re-run check</button>
+    </div>
     <div class="terminal-toolbar">
       <div class="terminal-identity">
         <strong id="terminal-session-name">{{ selected_worker.display_name }}</strong>
@@ -86,8 +119,12 @@
         <span id="terminal-status" class="status pending">connecting</span>
       </div>
     </div>
-    <div id="terminal" aria-label="Copilot terminal"></div>
+    <div id="terminal" aria-label="Claude terminal"></div>
   </section>
+
+  <div class="pane-splitter" data-pane="right" role="separator" tabindex="0"
+       aria-orientation="vertical" aria-label="Resize results panel"
+       title="Drag to resize · double-click to reset"></div>
 
   <aside class="rail details-rail" aria-label="Results and session reporting">
     <section class="rail-section">
@@ -159,7 +196,8 @@
           <article class="report-item">
             <strong>{{ person.display_name }}</strong>
             <small>{{ person.completed_count }} completed{% if person.success_rate is not none %} · {{ person.success_rate }}% success{% endif %}</small>
-            <small>{{ person.usage.recorded_tokens }} recorded tokens · {{ person.usage.premium_requests }} premium requests</small>
+            <small>{{ person.usage.recorded_tokens }} recorded tokens</small>
+            {% if person.spend_today %}<small>${{ "%.2f"|format(person.spend_today.cost_usd) }} today</small>{% endif %}
           </article>
           {% endfor %}
         </div>
@@ -174,8 +212,8 @@
   <pre id="result-dialog-content"></pre>
 </dialog>
 
-<script src="{{ url_for('static', path='vendor/xterm.js') }}"></script>
-<script src="{{ url_for('static', path='vendor/addon-fit.js') }}"></script>
+<script src="{{ url_for('static', path='vendor/xterm.js') }}?v={{ static_version }}"></script>
+<script src="{{ url_for('static', path='vendor/addon-fit.js') }}?v={{ static_version }}"></script>
 <script>
 const initialWorkers = {{ workers|tojson }};
 let workers = new Map(initialWorkers.map((worker) => [worker.id, worker]));
@@ -212,6 +250,7 @@ const copySelection = document.getElementById("copy-terminal-selection");
 const reconnectTerminal = document.getElementById("reconnect-terminal");
 const retireWorker = document.getElementById("retire-worker");
 const addWorker = document.getElementById("add-worker");
+const addWorkerType = document.getElementById("add-worker-type");
 const settingsToggle = document.getElementById("session-settings-toggle");
 const settingsPanel = document.getElementById("session-settings");
 const workerLimit = document.getElementById("worker-limit");
@@ -1644,6 +1683,7 @@ function renderSessions(state) {
       <span class="session-copy">
         <strong>${escapeHtml(worker.display_name)}</strong>
         <small class="session-activity">${escapeHtml(worker.activity_label || worker.state)}</small>
+        ${worker.spend_today ? `<small class="session-spend">${formatUsd(worker.spend_today.cost_usd)} today · ${formatCompact(worker.spend_today.tokens)} tokens</small>` : ""}
       </span>
       <span class="status ${escapeHtml(worker.state)}">${escapeHtml(worker.state.replaceAll("_", " "))}</span>
     </a>`).join("");
@@ -1659,6 +1699,68 @@ function renderSessions(state) {
   }
   addWorker.disabled =
     state.workers.filter((worker) => worker.role === "worker").length >= state.max_workers;
+  addWorkerType.disabled = addWorker.disabled;
+}
+
+function formatUsd(value) {
+  return `$${Number(value || 0).toFixed(2)}`;
+}
+
+function formatCompact(value) {
+  return new Intl.NumberFormat("en", {notation: "compact", maximumFractionDigits: 1})
+    .format(Number(value || 0));
+}
+
+const selfCheckBanner = document.getElementById("self-check-banner");
+const selfCheckMessage = document.getElementById("self-check-message");
+const selfCheckRerun = document.getElementById("self-check-rerun");
+let selfCheckRerunning = false;
+
+function renderSelfCheck(check) {
+  if (!check) return;
+  if (check.status !== "running") selfCheckRerunning = false;
+  selfCheckBanner.hidden = !(check.status === "failed" || selfCheckRerunning);
+  selfCheckRerun.disabled = selfCheckRerunning;
+  if (selfCheckRerunning) {
+    selfCheckMessage.textContent = "Checking that dispatched prompts reach Claude…";
+    return;
+  }
+  const change = check.previous_version && check.previous_version !== check.version
+    ? ` after Claude Code changed from ${check.previous_version} to ${check.version}`
+    : ` on ${check.version}`;
+  selfCheckMessage.textContent =
+    `Dispatch self-check failed${change}. Workers may not receive tasks. ${check.detail || ""}`;
+}
+
+selfCheckRerun.addEventListener("click", async () => {
+  selfCheckRerunning = true;
+  selfCheckRerun.disabled = true;
+  await fetch("/api/control/self-check", {method: "POST"});
+  await refreshState();
+});
+
+function renderSpend(spend) {
+  if (!spend) return;
+  const status = document.getElementById("budget-status");
+  status.textContent = spend.status;
+  status.className = `status ${spend.status}`;
+  document.getElementById("budget-remaining").textContent = formatUsd(spend.remaining_usd);
+  const meter = document.getElementById("budget-meter");
+  meter.className = `budget-meter ${spend.status}`;
+  meter.setAttribute("aria-valuemax", spend.budget_usd);
+  meter.setAttribute("aria-valuenow", spend.spent_usd);
+  meter.title = `${formatUsd(spend.spent_usd)} of ${formatUsd(spend.budget_usd)} spent today`
+    + ` · ${spend.total.requests} requests`
+    + (spend.total.estimated_requests
+      ? ` (${spend.total.estimated_requests} priced from token counts)`
+      : "");
+  document.getElementById("budget-fill").style.width =
+    `${Math.min(Number(spend.used_percent || 0), 100)}%`;
+  document.getElementById("budget-report").innerHTML = `
+    <dt>Spent</dt><dd>${formatUsd(spend.spent_usd)} of $${Number(spend.budget_usd).toFixed(0)}</dd>
+    <dt>Hub sessions</dt><dd>${formatUsd(spend.hub.cost_usd)}</dd>
+    <dt>Tokens</dt><dd>${formatCompact(spend.total.tokens)}</dd>`;
+  document.getElementById("budget-source").textContent = spend.source_label;
 }
 
 function renderWork(state) {
@@ -1742,6 +1844,8 @@ async function refreshState() {
     if (!response.ok) throw new Error("Hub state request failed");
     const state = await response.json();
     renderSessions(state);
+    renderSpend(state.spend);
+    renderSelfCheck(state.self_check);
     renderWork(state);
     renderMemory(state.memory);
     if (Number(resultCount.textContent) !== state.result_summary.total) {
@@ -1804,7 +1908,11 @@ retireWorker.addEventListener("click", async () => {
 
 addWorker.addEventListener("click", async () => {
   addWorker.disabled = true;
-  const response = await fetch("/api/agents/workers", {method: "POST"});
+  const response = await fetch("/api/agents/workers", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({worker_type: addWorkerType.value}),
+  });
   const payload = await response.json();
   if (!response.ok) {
     sessionFeedback.hidden = false;
@@ -1898,7 +2006,104 @@ window.addEventListener("popstate", () => {
 });
 
 window.addEventListener("resize", () => fitState(stateFor(workerId)));
-new ResizeObserver(() => fitState(stateFor(workerId))).observe(terminalElement);
+new ResizeObserver(() => {
+  // A pane drag resizes the terminal continuously; sync the PTY once when it ends.
+  if (!paneResizeActive) fitState(stateFor(workerId));
+}).observe(terminalElement);
+
+// The terminal containers are never meant to scroll. The browser still scrolls
+// overflow:hidden ancestors to reveal xterm's IME textarea when the cursor sits
+// near the right edge, which shifts the whole terminal left with no way back.
+document.addEventListener("scroll", (event) => {
+  const target = event.target;
+  if (
+    target instanceof Element
+    && target.matches(".workspace, .workspace-main, .terminal-pane, #terminal, .terminal-buffer, .xterm, .xterm-screen")
+    && target.scrollLeft
+  ) {
+    target.scrollLeft = 0;
+  }
+}, true);
+
+const workspaceElement = document.getElementById("workspace");
+const PANE_GUTTER_PX = 8 + 8 + 4 * 4;
+const TERMINAL_MIN_WIDTH_PX = 360;
+const paneLimits = {
+  left: {min: 200, max: 560, fallback: 310, rail: ".sessions-rail"},
+  right: {min: 240, max: 640, fallback: 390, rail: ".details-rail"},
+};
+let paneResizeActive = false;
+
+function paneWidth(side) {
+  const rail = workspaceElement.querySelector(paneLimits[side].rail);
+  return rail && rail.offsetParent !== null ? rail.getBoundingClientRect().width : 0;
+}
+
+function setPaneWidth(side, width, {persist = false} = {}) {
+  const limits = paneLimits[side];
+  const other = side === "left" ? "right" : "left";
+  const room = workspaceElement.clientWidth - PANE_GUTTER_PX - TERMINAL_MIN_WIDTH_PX
+    - paneWidth(other);
+  const clamped = Math.round(Math.max(limits.min, Math.min(limits.max, room, width)));
+  workspaceElement.style.setProperty(`--${side}-width`, `${clamped}px`);
+  const splitter = workspaceElement.querySelector(`.pane-splitter[data-pane="${side}"]`);
+  splitter?.setAttribute("aria-valuenow", String(clamped));
+  if (persist) savePreference(`${side}PaneWidth`, clamped);
+  return clamped;
+}
+
+function resetPaneWidth(side) {
+  workspaceElement.style.removeProperty(`--${side}-width`);
+  savePreference(`${side}PaneWidth`, null);
+  fitState(stateFor(workerId));
+}
+
+for (const side of Object.keys(paneLimits)) {
+  const saved = Number(readPreference(`${side}PaneWidth`));
+  if (saved > 0) setPaneWidth(side, saved);
+}
+
+workspaceElement.querySelectorAll(".pane-splitter").forEach((splitter) => {
+  const side = splitter.dataset.pane;
+  splitter.setAttribute("aria-valuemin", String(paneLimits[side].min));
+  splitter.setAttribute("aria-valuemax", String(paneLimits[side].max));
+  splitter.setAttribute("aria-valuenow", String(Math.round(paneWidth(side))));
+  splitter.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = paneWidth(side);
+    paneResizeActive = true;
+    splitter.setPointerCapture(event.pointerId);
+    splitter.classList.add("dragging");
+    document.body.classList.add("resizing-panes");
+    const move = (moveEvent) => {
+      const delta = moveEvent.clientX - startX;
+      setPaneWidth(side, side === "left" ? startWidth + delta : startWidth - delta);
+    };
+    const end = () => {
+      splitter.removeEventListener("pointermove", move);
+      splitter.removeEventListener("pointerup", end);
+      splitter.removeEventListener("pointercancel", end);
+      splitter.classList.remove("dragging");
+      document.body.classList.remove("resizing-panes");
+      paneResizeActive = false;
+      setPaneWidth(side, paneWidth(side), {persist: true});
+      fitState(stateFor(workerId));
+    };
+    splitter.addEventListener("pointermove", move);
+    splitter.addEventListener("pointerup", end);
+    splitter.addEventListener("pointercancel", end);
+  });
+  splitter.addEventListener("dblclick", () => resetPaneWidth(side));
+  splitter.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+    event.preventDefault();
+    const step = (event.shiftKey ? 64 : 16) * (event.key === "ArrowRight" ? 1 : -1);
+    setPaneWidth(side, paneWidth(side) + (side === "left" ? step : -step), {persist: true});
+    fitState(stateFor(workerId));
+  });
+});
 document.addEventListener("visibilitychange", () => {
   clearTimeout(reconnectTimer);
   clearTimeout(pollTimer);

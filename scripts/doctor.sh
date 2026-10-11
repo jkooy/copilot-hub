@@ -18,7 +18,7 @@ check_command() {
 }
 
 check_command uv
-check_command copilot
+check_command "${COPILOT_HUB_CLAUDE:-claude}"
 check_command curl
 
 if [[ -x "$ROOT/.venv/bin/copilot-hub" ]]; then
@@ -28,13 +28,23 @@ else
   FAILED=1
 fi
 
-if [[ -L "${HOME}/.copilot/skills/copilot-hub" ]] \
-  && [[ -f "${HOME}/.copilot/skills/copilot-hub/SKILL.md" ]]; then
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
+if [[ -L "${CLAUDE_DIR}/skills/copilot-hub" ]] \
+  && [[ -f "${CLAUDE_DIR}/skills/copilot-hub/SKILL.md" ]]; then
   echo "ok   skill link: copilot-hub"
 else
   echo "FAIL missing copilot-hub skill link"
   FAILED=1
 fi
+
+case "${COPILOT_HUB_PERMISSION_MODE:-bypassPermissions}" in
+  bypassPermissions)
+    echo "WARN managed sessions run with --dangerously-skip-permissions"
+    ;;
+  *)
+    echo "ok   managed sessions use permission mode ${COPILOT_HUB_PERMISSION_MODE}"
+    ;;
+esac
 
 if curl --connect-timeout 1 --max-time 5 -fsS \
   "http://${HOST}:${PORT}/api/agents/state" >/dev/null 2>&1; then

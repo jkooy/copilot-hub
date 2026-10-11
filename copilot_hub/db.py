@@ -861,7 +861,6 @@ class Repository:
                 UPDATE agent_tasks
                 SET status='dispatching', assigned_worker_id=?,
                     dispatch_generation=dispatch_generation + 1,
-                    dispatch_attempt=dispatch_attempt + 1,
                     dispatch_started_at=COALESCE(dispatch_started_at, ?),
                     dispatch_deadline_at=COALESCE(dispatch_deadline_at, ?),
                     dispatch_phase='preparing', dispatch_attempt_id=NULL,
@@ -890,19 +889,26 @@ class Repository:
         event_cursor: int,
         terminal_generation: int,
         attempt_limit: int,
-    ) -> bool:
+    ) -> dict[str, Any] | None:
+        """Claim the next delivery attempt and return the updated task.
+
+        ``dispatch_attempt`` counts delivery attempts across all workers, which
+        bounds the task's total budget.
+        """
         now = utc_now()
+        next_attempt = "dispatch_attempt + 1"
         with self.connect() as connection:
             cursor = connection.execute(
-                """
+                f"""
                 UPDATE agent_tasks
-                SET dispatch_attempt_id=?, dispatch_session_id=?,
+                SET dispatch_attempt={next_attempt},
+                    dispatch_attempt_id=?, dispatch_session_id=?,
                     dispatch_event_cursor=?, dispatch_terminal_generation=?,
                     dispatch_phase='not_rendered', dispatch_error=NULL,
                     updated_at=?
                 WHERE id=? AND assigned_worker_id=?
                   AND dispatch_generation=?
-                  AND status='dispatching' AND dispatch_attempt <= ?
+                  AND status='dispatching' AND {next_attempt} <= ?
                   AND dispatch_interaction_id IS NULL
                 """,
                 (
@@ -917,7 +923,9 @@ class Repository:
                     attempt_limit,
                 ),
             )
-            return cursor.rowcount == 1
+            if cursor.rowcount != 1:
+                return None
+        return self.get_agent_task(task_id)
 
     def update_agent_task_dispatch_phase(
         self,
@@ -1193,6 +1201,39 @@ class Repository:
                 WHERE {' AND '.join(clauses)}
                 """,
                 parameters,
+            )
+            return cursor.rowcount == 1
+
+    def advance_direct_interaction(
+        self,
+        worker_id: str,
+        *,
+        generation: int,
+        from_interaction_id: str,
+        to_interaction_id: str,
+    ) -> bool:
+        """Follow a direct activity to a later interaction in the same terminal.
+
+        Prompts typed while Claude is still working join the tracked direct
+        activity instead of registering a new one, so the activity must move to
+        the newest interaction before it can finish.
+        """
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE agent_workers
+                SET direct_interaction_id=?, activity_updated_at=?, updated_at=?
+                WHERE id=? AND direct_generation=? AND direct_submitted_at IS NOT NULL
+                  AND direct_interaction_id=?
+                """,
+                (
+                    to_interaction_id,
+                    utc_now(),
+                    utc_now(),
+                    worker_id,
+                    generation,
+                    from_interaction_id,
+                ),
             )
             return cursor.rowcount == 1
 

@@ -4,12 +4,14 @@ import argparse
 import ipaddress
 import json
 import os
+import sys
 import urllib.error
 import urllib.request
 import webbrowser
 
 import uvicorn
 
+from . import dispatch_inbox
 from .config import (
     DEFAULT_AGENT_MAX_WORKERS,
     Settings,
@@ -17,6 +19,7 @@ from .config import (
 )
 from .db import Repository
 from .restart import normalized_tool_path
+from .worker_types import TASK_TYPE_ALIASES, WORKER_TYPES, worker_type_of
 
 
 def validate_bind_host(host: str, *, allow_remote: bool) -> str:
@@ -57,8 +60,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Dispatch a task to a persistent worker",
     )
     dispatch.add_argument("--title", required=True)
-    dispatch.add_argument("--prompt", required=True)
-    dispatch.add_argument("--task-type", default="work")
+    dispatch.add_argument(
+        "--prompt",
+        required=True,
+        help="Task prompt, or - to read it from stdin",
+    )
+    dispatch.add_argument(
+        "--task-type",
+        default="code",
+        choices=[*WORKER_TYPES, *TASK_TYPE_ALIASES],
+        help="Worker type that should take the task",
+    )
     dispatch.add_argument("--requires-approval", action="store_true")
 
     subparsers.add_parser("status", help="Show session and task state")
@@ -91,6 +103,41 @@ def get_json(url: str) -> dict[str, object]:
         raise RuntimeError("Copilot Hub server is not reachable") from exc
 
 
+def in_managed_session() -> bool:
+    return bool(os.environ.get("COPILOT_HUB_WORKER_ID"))
+
+
+def local_status(repository: Repository) -> dict[str, object]:
+    """Worker and task summary read straight from the Hub database."""
+    workers = repository.list_agent_workers()
+    names = {worker["id"]: worker["name"] for worker in workers}
+    return {
+        "workers": [
+            {
+                "name": worker["name"],
+                "role": worker["role"],
+                "worker_type": (
+                    worker_type_of(worker).key if worker_type_of(worker) else None
+                ),
+                "state": worker["state"],
+                "current_task_id": worker.get("current_task_id"),
+            }
+            for worker in workers
+        ],
+        "recent_tasks": [
+            {
+                "id": task["id"],
+                "title": task["title"],
+                "task_type": task["task_type"],
+                "status": task["status"],
+                "worker": names.get(task.get("assigned_worker_id")),
+            }
+            for task in repository.list_agent_tasks(limit=20, include_result=False)
+            if task["task_type"] != "manager"
+        ],
+    }
+
+
 def main() -> None:
     args = build_parser().parse_args()
     settings = Settings.from_env()
@@ -115,24 +162,36 @@ def main() -> None:
         )
         return
     if args.command == "dispatch":
-        result = post_json(
-            f"{base_url}/api/agents/tasks",
-            {
-                "title": args.title,
-                "prompt": args.prompt,
-                "task_type": args.task_type,
-                "requires_approval": args.requires_approval,
-            },
-        )
-        print(json.dumps(result, indent=2))
+        prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
+        if not prompt.strip():
+            raise SystemExit("copilot-hub dispatch: the prompt is empty")
+        payload: dict[str, object] = {
+            "title": args.title,
+            "prompt": prompt.strip(),
+            "task_type": args.task_type,
+            "requires_approval": args.requires_approval,
+        }
+        # Managed sessions run shell commands in a sandbox without loopback network
+        # access, so they hand the request to the server through the state directory.
+        if in_managed_session():
+            result = dispatch_inbox.submit_request(settings.state_dir, payload)
+        else:
+            try:
+                result = post_json(f"{base_url}/api/agents/tasks", payload)
+            except RuntimeError:
+                result = dispatch_inbox.submit_request(settings.state_dir, payload)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        if result.get("status") == "error":
+            raise SystemExit(1)
         return
     if args.command == "status":
-        print(
-            json.dumps(
-                get_json(f"{base_url}/api/agents/state?compact=true"),
-                indent=2,
-            )
-        )
+        state = None
+        if not in_managed_session():
+            try:
+                state = get_json(f"{base_url}/api/agents/state?compact=true")
+            except RuntimeError:
+                state = None
+        print(json.dumps(state or local_status(repository), indent=2, ensure_ascii=False))
         return
     if args.command == "restart":
         worker_id = os.environ.get("COPILOT_HUB_WORKER_ID")
@@ -158,3 +217,7 @@ def main() -> None:
         return
     if args.command == "open":
         webbrowser.open(base_url)
+
+
+if __name__ == "__main__":
+    main()

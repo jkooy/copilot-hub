@@ -21,7 +21,8 @@ def settings(tmp_path, *, terminals_enabled=False):
         log_dir=tmp_path / "state" / "logs",
         host="127.0.0.1",
         port=9988,
-        copilot_executable="copilot",
+        claude_executable="claude",
+        permission_mode="bypassPermissions",
         agent_default_cwd=str(tmp_path / "work"),
         agent_model="model",
         agent_reasoning_effort="high",
@@ -47,10 +48,13 @@ def test_manager_and_workers_use_generic_stable_names(tmp_path):
     manager = runtime.ensure_manager()
     first = runtime.add_worker()
     second = runtime.add_worker()
+    reviewer = runtime.add_worker("review")
 
     assert manager["name"] == "copilot-hub-manager"
-    assert first["name"] == "worker-1"
-    assert second["name"] == "worker-2"
+    assert first["name"] == "coder-1"
+    assert second["name"] == "coder-2"
+    assert reviewer["name"] == "reviewer-1"
+    assert reviewer["capabilities"] == ["review"]
     assert repository.get_state("agent_manager_session_id") == (
         manager["copilot_session_id"]
     )
@@ -232,3 +236,60 @@ def test_normal_manager_task_uses_persistent_terminal_once(tmp_path, monkeypatch
     assert len(terminal.sent_prompts) == 1
     assert terminal.wait_count == 1
     assert "Summarize the local worker pool." in terminal.sent_prompts[0][1]
+
+
+def test_unknown_worker_type_is_rejected(tmp_path):
+    _, runtime = repository_and_runtime(tmp_path)
+    with pytest.raises(ValueError, match="Unknown worker type"):
+        runtime.add_worker("astronaut")
+
+
+def test_tasks_route_to_matching_worker_type_then_borrow_when_full(tmp_path, monkeypatch):
+    repository, runtime = repository_and_runtime(tmp_path)
+    runtime.ensure_manager()
+    leased = []
+
+    def lease(worker_id, task_id):
+        worker = repository.get_agent_worker(worker_id)
+        if worker["state"] != "idle":
+            return False
+        repository.update_agent_worker(worker_id, state="busy")
+        leased.append(worker["name"])
+        return True
+
+    monkeypatch.setattr(repository, "try_lease_agent_worker", lease)
+
+    research = runtime._acquire_worker({"id": "t1", "task_type": "research"})
+    code = runtime._acquire_worker({"id": "t2", "task_type": "code"})
+    assert (research["name"], code["name"]) == ("researcher-1", "coder-1")
+
+    repository.update_agent_worker(research["id"], state="idle")
+    again = runtime._acquire_worker({"id": "t3", "task_type": "read"})
+    assert again["id"] == research["id"]
+
+    operator = runtime._acquire_worker({"id": "t4", "task_type": "operate"})
+    assert operator["name"] == "operator-1"
+
+    # The fixture allows three workers; another type now borrows an idle worker.
+    repository.update_agent_worker(research["id"], state="idle")
+    borrowed = runtime._acquire_worker({"id": "t5", "task_type": "review"})
+    assert borrowed["id"] == research["id"]
+    assert runtime._acquire_worker({"id": "t6", "task_type": "review"}) is None
+
+
+def test_worker_prompt_carries_role_and_manager_knows_worker_types(tmp_path):
+    repository, runtime = repository_and_runtime(tmp_path)
+    runtime.ensure_manager()
+    worker_prompt = runtime._worker_prompt({"task_type": "review", "requested_prompt": "check"})
+    assert "You are the reviewer." in worker_prompt
+
+    task = repository.create_agent_task(
+        title="hi",
+        task_type="manager",
+        requested_prompt="hi",
+        status="queued",
+    )
+    manager_prompt = runtime._manager_prompt(task)
+    assert '"task_type": "code|research|review|operate"' in manager_prompt
+    for label in ("coder", "researcher", "reviewer", "operator"):
+        assert label in manager_prompt

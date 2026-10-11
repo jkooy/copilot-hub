@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import claude_events, session_prompts
 from .config import (
     MAX_AGENT_MAX_WORKERS,
     MIN_AGENT_MAX_WORKERS,
@@ -27,6 +28,13 @@ from .db import (
     Repository,
     agent_manager_update_content,
     utc_now,
+)
+from .worker_types import (
+    DEFAULT_WORKER_TYPE,
+    WORKER_TYPES,
+    manager_worker_type_guide,
+    worker_type_for_task,
+    worker_type_of,
 )
 
 if TYPE_CHECKING:
@@ -154,9 +162,9 @@ class CopilotAgentRuntime:
     TRANSIENT_TERMINAL_ERROR_MARKERS = (
         "did not accept the dispatched prompt",
         "did not render the dispatched prompt",
-        "timed out waiting for copilot terminal readiness",
+        "timed out waiting for claude terminal readiness",
         "terminal exited before becoming ready",
-        "copilot terminal is still working",
+        "claude terminal is still working",
         "session in use",
     )
 
@@ -234,7 +242,7 @@ class CopilotAgentRuntime:
             return
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             return
         try:
             process.wait(timeout=timeout_seconds)
@@ -243,7 +251,7 @@ class CopilotAgentRuntime:
             pass
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             return
         process.wait(timeout=timeout_seconds)
 
@@ -632,7 +640,12 @@ class CopilotAgentRuntime:
         self.dispatch_queued()
         return value
 
-    def add_worker(self) -> dict[str, Any]:
+    def add_worker(self, worker_type: str = DEFAULT_WORKER_TYPE) -> dict[str, Any]:
+        if worker_type not in WORKER_TYPES:
+            raise ValueError(
+                f"Unknown worker type {worker_type!r}; choose one of: {', '.join(WORKER_TYPES)}"
+            )
+        specialty = WORKER_TYPES[worker_type]
         with self._lock:
             workers = self.repository.list_agent_workers(role="worker")
             if len(workers) >= self.max_workers:
@@ -641,15 +654,16 @@ class CopilotAgentRuntime:
                 role="worker",
                 include_retired=True,
             )
+            same_type = [item for item in all_workers if worker_type_of(item) == specialty]
             worker = self.repository.create_agent_worker(
                 copilot_session_id=str(uuid.uuid4()),
-                name=f"worker-{len(all_workers) + 1}",
+                name=f"{specialty.label}-{len(same_type) + 1}",
                 role="worker",
                 model=self.settings.agent_model,
                 reasoning_effort=self.settings.agent_reasoning_effort,
                 context_tier=self.settings.agent_context_tier,
                 cwd=self.settings.agent_default_cwd,
-                capabilities=["commands", "code", "research"],
+                capabilities=[specialty.key],
             )
         if self.terminal_runtime and self.settings.terminals_enabled:
             self.terminal_runtime.ensure_terminal(worker, wait_for_ready=False)
@@ -661,7 +675,7 @@ class CopilotAgentRuntime:
             if not worker:
                 raise KeyError("Worker not found")
             if worker["role"] == "manager":
-                raise ValueError("The Copilot manager cannot be retired")
+                raise ValueError("The Claude manager cannot be retired")
             if worker.get("retired_at"):
                 return worker
             if (
@@ -944,26 +958,38 @@ class CopilotAgentRuntime:
             raise
 
     def _acquire_worker(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        """Lease a worker for a task, preferring the task's specialty.
+
+        Order: an idle worker of the matching type, then a new worker of that
+        type while under the limit, then any idle worker. The worker prompt
+        carries the specialty instructions, so a borrowed worker still knows
+        its role for this task.
+        """
+        specialty = worker_type_for_task(task.get("task_type"))
         workers = self.repository.list_agent_workers(role="worker")
         excluded_worker_id = task.get("dispatch_excluded_worker_id")
+        probing = getattr(self.terminal_runtime, "is_probing", None)
         idle = [
             worker
             for worker in workers
-            if worker["state"] == "idle" and worker["id"] != excluded_worker_id
+            if worker["state"] == "idle"
+            and worker["id"] != excluded_worker_id
+            and not (probing and probing(worker["id"]))
         ]
-        if idle:
-            for worker in idle:
-                if self.repository.try_lease_agent_worker(
-                    worker["id"],
-                    task["id"],
-                ):
-                    return self.repository.get_agent_worker(worker["id"])
+        matching = [worker for worker in idle if worker_type_of(worker) == specialty]
+        for worker in matching:
+            if self.repository.try_lease_agent_worker(worker["id"], task["id"]):
+                return self.repository.get_agent_worker(worker["id"])
+        if len(workers) < self.max_workers:
+            worker = self.add_worker(specialty.key)
+            if self.repository.try_lease_agent_worker(worker["id"], task["id"]):
+                return self.repository.get_agent_worker(worker["id"])
             return None
-        if len(workers) >= self.max_workers:
-            return None
-        worker = self.add_worker()
-        if self.repository.try_lease_agent_worker(worker["id"], task["id"]):
-            return self.repository.get_agent_worker(worker["id"])
+        for worker in idle:
+            if worker in matching:
+                continue
+            if self.repository.try_lease_agent_worker(worker["id"], task["id"]):
+                return self.repository.get_agent_worker(worker["id"])
         return None
 
     def _manager_prompt(self, task: dict[str, Any]) -> str:
@@ -972,6 +998,7 @@ class CopilotAgentRuntime:
                 "name": item["name"],
                 "state": item["state"],
                 "role": item["role"],
+                "worker_type": (worker_type_of(item).key if worker_type_of(item) else None),
                 "session_id": item["copilot_session_id"],
             }
             for item in self.repository.list_agent_workers()
@@ -992,7 +1019,7 @@ Interpret the user's request and decide whether worker tasks are needed.
 You do not execute shell commands or modify files yourself.
 
 Routing rules:
-- Behave like an ordinary Copilot CLI session for conversation and read-only
+- Behave like an ordinary Claude Code session for conversation and read-only
   questions about this local Hub, its configuration, and its worker pool.
 - Delegate implementation, code or file changes, command execution, tool use,
   long-running work, and any task that needs fresh inspection outside the
@@ -1016,9 +1043,19 @@ Safety rules:
 - Ask for clarification in response instead of inventing paths, credentials,
   commands, or destructive scope.
 - Prefer one cohesive worker task. Split only genuinely independent work.
+  Independent tasks run in parallel on separate workers.
 - Include complete context in every worker prompt.
 
-Current Copilot workers:
+Worker types (choose one per task with `task_type`; the Hub routes the task to
+an idle worker of that type, or starts one):
+{json.dumps(manager_worker_type_guide(), ensure_ascii=False)}
+- Use `research` for investigation and read-only questions that need fresh
+  inspection, `code` for implementation, `review` to check a change or design,
+  and `operate` for commands, builds, deployments, and environment changes.
+- For substantial code changes, consider a follow-up `review` task after the
+  `code` task reports back.
+
+Current Claude workers:
 {json.dumps(workers, ensure_ascii=False)}
 
 Recent worker handoffs:
@@ -1060,7 +1097,7 @@ Return exactly one JSON object:
     {{
       "title": "short task title",
       "prompt": "complete autonomous worker prompt",
-      "task_type": "read|operate|code|research",
+      "task_type": "code|research|review|operate",
       "requires_approval": false
     }}
   ]
@@ -1250,9 +1287,13 @@ Worker result:
             raise ManagerResultRetryableError(str(exc)) from exc
 
     def _worker_prompt(self, task: dict[str, Any]) -> str:
+        specialty = worker_type_for_task(task.get("task_type"))
         return f"""
 You are an execution worker controlled by the local personal Copilot Hub.
 Complete the task autonomously and verify the outcome.
+
+Role:
+{specialty.instructions}
 
 Task:
 {task["requested_prompt"]}
@@ -1685,7 +1726,7 @@ Rules:
                 return
             except RuntimeError as exc:
                 recovery_reason = (
-                    f"Copilot terminal readiness timed out after task completion: {exc}"
+                    f"Claude terminal readiness timed out after task completion: {exc}"
                 )
         recovery_event_payload = None
         if recovery_reason is not None:
@@ -1814,7 +1855,7 @@ Rules:
         worker_id: str,
         generation: int,
     ) -> None:
-        last_error = "Copilot terminal did not become ready"
+        last_error = "Claude terminal did not become ready"
         worker = self.repository.get_agent_worker(worker_id)
         recovery = self._recovery_interaction(worker, generation) if worker is not None else None
 
@@ -1872,7 +1913,7 @@ Rules:
                 worker_id,
                 generation=generation,
                 attempt=1,
-                error="Waiting for resumed Copilot interaction to finish",
+                error="Waiting for resumed Claude interaction to finish",
             )
             while True:
                 ownership_guard()
@@ -1891,9 +1932,9 @@ Rules:
                     None,
                 )
                 if worker and terminal_is_running and not terminal_is_running(worker):
-                    raise RuntimeError("Resumed Copilot interaction terminal exited")
+                    raise RuntimeError("Resumed Claude interaction terminal exited")
                 if time.monotonic() >= deadline:
-                    raise RuntimeError("Timed out waiting for resumed Copilot interaction")
+                    raise RuntimeError("Timed out waiting for resumed Claude interaction")
                 self._guarded_sleep(0.2, ownership_guard)
                 current = interaction_state()
                 if current:
@@ -1916,7 +1957,7 @@ Rules:
                     generation=generation,
                     attempt=attempt,
                     error=(
-                        worker.get("recovery_error") or "Checking Copilot terminal input readiness"
+                        worker.get("recovery_error") or "Checking Claude terminal input readiness"
                     ),
                 ):
                     return
@@ -1964,7 +2005,7 @@ Rules:
                     worker_id,
                     generation=generation,
                     error=(
-                        "Copilot terminal recovery could not create a fresh "
+                        "Claude terminal recovery could not create a fresh "
                         "session after bounded readiness checks"
                     ),
                 )
@@ -1981,7 +2022,7 @@ Rules:
                 ):
                     return
                 attempt = self.RECOVERY_READY_ATTEMPTS + recycle_attempt
-                recovery_error = f"Rebinding Copilot terminal after readiness failure: {last_error}"
+                recovery_error = f"Rebinding Claude terminal after readiness failure: {last_error}"
                 if not self.repository.update_agent_worker_recovery(
                     worker_id,
                     generation=generation,
@@ -2021,7 +2062,7 @@ Rules:
                 worker_id,
                 generation=generation,
                 error=(
-                    "Copilot terminal recovery failed after fresh-session "
+                    "Claude terminal recovery failed after fresh-session "
                     f"startup checks: {last_error}"
                 ),
             )
@@ -2302,7 +2343,7 @@ Rules:
         return (
             f"Hub lifecycle recovery continuation for task {task_id}. "
             "This is not a repeat of the original task prompt.\n\n"
-            f"The Hub restarted while prior Copilot session {source_session_id}, "
+            f"The Hub restarted while prior Claude session {source_session_id}, "
             f"interaction {source_interaction_id}, had attached local tool execution "
             f"without a completion event: {tool_summary or 'unknown local tool'}. "
             "That old local tool invocation cannot report completion to this resumed "
@@ -2372,7 +2413,7 @@ Rules:
         )
         if send_recovery is None:
             error = (
-                "Copilot local tool was interrupted by Hub restart, but safe "
+                "Claude local tool was interrupted by Hub restart, but safe "
                 "continuation delivery is unavailable"
             )
             self.repository.finish_agent_task_interruption_recovery(
@@ -2433,7 +2474,7 @@ Rules:
             )
             if not sent:
                 error = (
-                    "Copilot local tool was interrupted by Hub restart, but the "
+                    "Claude local tool was interrupted by Hub restart, but the "
                     "terminal was not clear for one safe recovery continuation"
                 )
                 self.repository.finish_agent_task_interruption_recovery(
@@ -2800,11 +2841,11 @@ Rules:
                 ):
                     if recover_terminal is None:
                         raise TerminalExecutionLostError(
-                            "Copilot terminal exited after accepting the task; "
+                            "Claude terminal exited after accepting the task; "
                             "accepted interaction recovery is unavailable"
                         )
                     raise TerminalExecutionLostError(
-                        "Accepted Copilot interaction could not be resumed after "
+                        "Accepted Claude interaction could not be resumed after "
                         f"{recovery_attempt - 1} "
                         "terminal recovery attempts"
                     )
@@ -2819,7 +2860,7 @@ Rules:
                     else ""
                 )
                 recovery_error = (
-                    "Recovering accepted Copilot interaction after terminal process exit"
+                    "Recovering accepted Claude interaction after terminal process exit"
                     f"{exit_detail}"
                 )
                 self.repository.add_agent_event(
@@ -2856,7 +2897,7 @@ Rules:
                     guard()
                     if not terminal_is_running(recovered):
                         raise RuntimeError(
-                            "Recovered Copilot terminal exited before monitoring resumed"
+                            "Recovered Claude terminal exited before monitoring resumed"
                         )
                     if not self.repository.finish_agent_task_terminal_recovery(
                         current_worker["id"],
@@ -2890,7 +2931,7 @@ Rules:
                     )
                     if recovery_attempt >= self.ACCEPTED_TERMINAL_RECOVERY_ATTEMPTS:
                         raise TerminalExecutionLostError(
-                            "Accepted Copilot interaction could not be resumed after "
+                            "Accepted Claude interaction could not be resumed after "
                             f"{recovery_attempt} terminal recovery attempts: {exc}"
                         ) from exc
                     self._guarded_sleep(0.25 * recovery_attempt, guard)
@@ -2925,7 +2966,7 @@ Rules:
         prompt = self._worker_prompt(task)
         assignment_start_attempt = int(task.get("dispatch_attempt") or 0)
         guard = self._task_guard(task_id, worker["id"], generation)
-        last_error = "Copilot did not accept the dispatched prompt"
+        last_error = "Claude did not accept the dispatched prompt"
         accepted: InteractiveAttempt | None = None
         while accepted is None:
             current_task, current_worker = self._active_worker_task(
@@ -2941,13 +2982,13 @@ Rules:
             worker_attempts = global_attempt - assignment_start_attempt
             if global_attempt >= self.DISPATCH_ATTEMPT_LIMIT:
                 raise WorkerUnavailableError(
-                    "Copilot terminal dispatch exhausted the four-attempt task budget: "
+                    "Claude terminal dispatch exhausted the four-attempt task budget: "
                     f"{last_error}",
                     allow_requeue=False,
                 )
             if worker_attempts >= self.DISPATCH_ATTEMPTS_PER_WORKER:
                 raise WorkerUnavailableError(
-                    f"Copilot terminal failed both bounded attempts on this worker: {last_error}",
+                    f"Claude terminal failed both bounded attempts on this worker: {last_error}",
                     allow_requeue=True,
                 )
             cursor = self.terminal_runtime.event_cursor(current_worker["copilot_session_id"])
@@ -2970,7 +3011,7 @@ Rules:
             if not claimed:
                 guard()
                 raise WorkerUnavailableError(
-                    "Copilot terminal dispatch budget could not be claimed",
+                    "Claude terminal dispatch budget could not be claimed",
                     allow_requeue=False,
                 )
             attempt_number = int(claimed["dispatch_attempt"])
@@ -2994,7 +3035,7 @@ Rules:
             try:
                 if attempt_number > assignment_start_attempt + 1:
                     recovery_error = (
-                        "Rebinding Copilot terminal for persisted dispatch attempt "
+                        "Rebinding Claude terminal for persisted dispatch attempt "
                         f"{attempt_number}: {last_error}"
                     )
                     current_worker = self._call_with_supported_kwargs(
@@ -3233,6 +3274,42 @@ Rules:
             "terminalGeneration": accepted.terminal_generation,
         }
 
+    @staticmethod
+    def _claude_stream_events(message: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        """Map one ``claude -p --output-format stream-json`` message to task events."""
+        message_type = message.get("type")
+        if message_type == "result":
+            return [("result", message)]
+        if message_type not in {"assistant", "user"} or message.get("parent_tool_use_id"):
+            return []
+        content = (message.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            return []
+        events: list[tuple[str, dict[str, Any]]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and block.get("text"):
+                events.append(("assistant.message", {"content": block["text"]}))
+            elif block.get("type") == "tool_use":
+                events.append(
+                    (
+                        "tool.execution_start",
+                        {"toolCallId": block.get("id"), "toolName": block.get("name")},
+                    )
+                )
+            elif block.get("type") == "tool_result":
+                events.append(
+                    (
+                        "tool.execution_complete",
+                        {
+                            "toolCallId": block.get("tool_use_id"),
+                            "success": not block.get("is_error"),
+                        },
+                    )
+                )
+        return events
+
     def _run_copilot(
         self,
         *,
@@ -3252,27 +3329,40 @@ Rules:
             )
             self.repository.update_agent_task(task_id, log_path=str(log_path))
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        permission_args, permission_settings = claude_events.permission_arguments(
+            self.settings.permission_mode
+        )
         args = [
-            self.settings.copilot_executable,
+            self.settings.claude_executable,
             "-p",
             prompt,
             "--model",
-            worker["model"],
+            claude_events.model_argument(str(worker["model"]), worker.get("context_tier")),
             "--effort",
             worker["reasoning_effort"],
-            "--context",
-            worker["context_tier"],
             "--output-format",
-            "json",
-            "--yolo",
-            "--no-ask-user",
-            "--no-remote-export",
-            "--no-color",
-            "--stream",
+            "stream-json",
+            "--verbose",
+            *permission_args,
+            "--settings",
+            json.dumps(
+                {
+                    **claude_events.hook_settings(self.settings.state_dir),
+                    **permission_settings,
+                }
+            ),
+            "--append-system-prompt",
+            session_prompts.session_instructions(worker),
+            "--system-prompt-snapshot",
             "off",
         ]
-        if int(worker.get("turn_count", 0)) > 0:
-            args.append(f"--resume={worker['copilot_session_id']}")
+        sessions_root = self.settings.sessions_dir
+        if claude_events.find_transcript(worker["copilot_session_id"], sessions_root):
+            resume_id = claude_events.resume_session_id(
+                worker["copilot_session_id"],
+                sessions_root,
+            )
+            args.append(f"--resume={resume_id}")
         else:
             args.extend(
                 [
@@ -3290,6 +3380,15 @@ Rules:
             process = subprocess.Popen(
                 args,
                 cwd=cwd,
+                env={
+                    **claude_events.child_environment(os.environ),
+                    "COPILOT_HUB_ROLE": worker["role"],
+                    "COPILOT_HUB_WORKER_ID": worker["id"],
+                    "COPILOT_HUB_SESSION_ID": worker["copilot_session_id"],
+                    "COPILOT_HUB_STATE_DIR": str(self.settings.state_dir),
+                    "COPILOT_HUB_PORT": str(self.settings.port),
+                },
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -3321,27 +3420,23 @@ Rules:
                     log.flush()
                     line = raw_line.strip()
                     try:
-                        event = json.loads(line)
+                        message = json.loads(line)
                     except json.JSONDecodeError:
-                        event = {"type": "copilot.output", "data": {"text": line}}
-                    event_type = str(event.get("type") or "copilot.output")
-                    if event_type in {
-                        "assistant.message",
-                        "assistant.turn_start",
-                        "assistant.turn_end",
-                        "tool.execution_start",
-                        "tool.execution_complete",
-                        "result",
-                    }:
+                        message = {"type": "claude.output", "text": line}
+                    if not isinstance(message, dict):
+                        continue
+                    for event_type, payload in self._claude_stream_events(message):
                         self.repository.add_agent_event(
                             task_id=task_id,
                             event_type=event_type,
-                            payload=event.get("data") or event,
+                            payload=payload,
                         )
-                    if event_type == "assistant.message":
-                        assistant_response = str((event.get("data") or {}).get("content") or "")
-                    elif event_type == "result":
-                        result_payload = event
+                        if event_type == "assistant.message":
+                            assistant_response = str(payload.get("content") or "")
+                    if message.get("type") == "result":
+                        result_payload = message
+                        if isinstance(message.get("result"), str) and message["result"]:
+                            assistant_response = message["result"]
                     self.repository.update_agent_worker(
                         worker["id"],
                         activity_updated_at=utc_now(),
@@ -3356,8 +3451,11 @@ Rules:
                     finished_at=utc_now(),
                 )
                 raise TaskCancelledError("Task was cancelled")
-            if return_code != 0:
-                raise RuntimeError(f"Copilot exited with status {return_code}")
+            if return_code != 0 or result_payload.get("is_error"):
+                raise RuntimeError(
+                    f"Claude exited with status {return_code}: "
+                    f"{result_payload.get('result') or result_payload.get('subtype') or ''}"
+                )
             return assistant_response, result_payload
         finally:
             if process is not None:
